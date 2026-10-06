@@ -102,6 +102,11 @@ import { exportSkfProject, SKF_MEDIA_TYPE } from "@/lib/skfProject";
 import { makeShapeFromAsset, sceneShape, toolbarShapeAssets, type ToolbarShapeAsset } from "@/lib/shapeCatalog";
 import { importExtensionSupported } from "@/lib/importExtensions";
 import { importedShapeFromStl } from "@/lib/stlImport";
+import { generateOpenScadFromShapes, resolveOpenScadImports } from "@/lib/openscadCodegen";
+import { DEFAULT_OPENSCAD_SOURCE, isOpenScadShape, openScadShapeFromStl } from "@/lib/openscadImport";
+import { cancelOpenScadRender, openScadRuntimeAvailable, renderOpenScad } from "@/lib/openscadRuntime";
+import type { OpenScadInputFile } from "@/lib/openscadTypes";
+import { OpenScadWorkspace, type OpenScadRenderStatus } from "./OpenScadWorkspace";
 import { exportMeshesToStl } from "@/lib/stlExport";
 import { importedShapeFromSvg, invalidSvgMeshReason } from "@/lib/svgImport";
 import { toSvgProjection, type SvgProjectionLayer } from "@/lib/svgExport";
@@ -137,7 +142,8 @@ type ExportFormat = "stl" | "obj" | "step" | "svg" | "skf";
 type DirectExportFormat = Exclude<ExportFormat, "step" | "skf">;
 type SkfHistoryLimit = EditorHistoryExportLimit;
 type SkfExportTarget = "download" | "shared";
-type ToolbarMode = "geometry" | "sketch";
+type ToolbarMode = "geometry" | "sketch" | "openscad";
+type OpenScadTarget = { kind: "replace"; shapeIds: string[] } | { kind: "update"; shapeId: string } | null;
 type Vec3 = [number, number, number];
 type MeshData = { name: string; vertices: Vec3[]; faces: [number, number, number][] };
 type Cuboid = { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number };
@@ -5524,6 +5530,15 @@ export function SketchForgeEditor({
   const interactionHistoryTimerRef = useRef<number | null>(null);
   const [projectInteractionActive, setProjectInteractionActive] = useState(false);
   const [toolbarMode, setToolbarMode] = useState<ToolbarMode>("geometry");
+  // OpenSCAD workspace (fork feature, see FORK.md). The draft lives here so it survives
+  // switching tabs; the last generated/loaded text is kept as a baseline to tell whether
+  // the user has edited it.
+  const [openscadSource, setOpenscadSource] = useState(DEFAULT_OPENSCAD_SOURCE);
+  const [openscadBaseline, setOpenscadBaseline] = useState(DEFAULT_OPENSCAD_SOURCE);
+  const [openscadFiles, setOpenscadFiles] = useState<OpenScadInputFile[]>([]);
+  const [openscadTarget, setOpenscadTarget] = useState<OpenScadTarget>(null);
+  const [openscadReplaceSources, setOpenscadReplaceSources] = useState(true);
+  const [openscadStatus, setOpenscadStatus] = useState<OpenScadRenderStatus>({ state: "idle", log: [] });
   const [sketchActive, setSketchActive] = useState(false);
   const [activeSketchWorkplane, setActiveSketchWorkplane] = useState<PlacementWorkplane>(
     () => normalizePlacementWorkplane(initialPlacementWorkplane, initialPlacementElevation),
@@ -6306,6 +6321,122 @@ export function SketchForgeEditor({
     },
     [appendHistorySnapshot, selectedIds, syncProjectShapes],
   );
+
+  // ---- OpenSCAD workspace (fork feature, see FORK.md) ----
+
+  const loadOpenScadShape = useCallback((shape: WorkplaneShape & { openscadSource: string }) => {
+    setOpenscadSource(shape.openscadSource);
+    setOpenscadBaseline(shape.openscadSource);
+    setOpenscadFiles([]);
+    setOpenscadTarget({ kind: "update", shapeId: shape.id });
+    setOpenscadStatus({ state: "idle", log: [] });
+    setNotice(`Editing OpenSCAD source of ${shape.name}`);
+  }, []);
+
+  const loadOpenScadFromShapes = useCallback((sourceShapes: WorkplaneShape[], origin: "scene" | "selection") => {
+    // A single selected code-backed shape loads its script instead of being re-generated as a mesh import.
+    if (origin === "selection" && sourceShapes.length === 1 && isOpenScadShape(sourceShapes[0])) {
+      loadOpenScadShape(sourceShapes[0]);
+      return;
+    }
+    const result = generateOpenScadFromShapes(sourceShapes, { localMeshForShape: geometryMeshForShape });
+    setOpenscadSource(result.source);
+    setOpenscadBaseline(result.source);
+    setOpenscadFiles(result.files);
+    setOpenscadTarget(result.shapeIds.length ? { kind: "replace", shapeIds: result.shapeIds } : null);
+    setOpenscadStatus({ state: "idle", log: result.warnings.map((warning) => `WARNING: ${warning}`) });
+    const count = result.shapeIds.length;
+    setNotice(`Generated OpenSCAD from ${count} ${origin === "selection" ? "selected " : ""}shape${count === 1 ? "" : "s"}`);
+  }, [loadOpenScadShape]);
+
+  // Decides what the editor shows when the OpenSCAD tab is opened. Unsaved edits are
+  // never discarded automatically; the "From scene"/"From selection" buttons are explicit.
+  const enterOpenScadMode = useCallback(() => {
+    const selected = selectedIdsRef.current
+      .map((id) => shapesRef.current.find((shape) => shape.id === id))
+      .filter((shape): shape is WorkplaneShape => Boolean(shape));
+    const pristine = openscadSource === openscadBaseline;
+    if (!pristine) {
+      if (selected.length === 1 && isOpenScadShape(selected[0]) && !(openscadTarget?.kind === "update" && openscadTarget.shapeId === selected[0].id)) {
+        setNotice(`Kept unsaved OpenSCAD edits; use “From selection” to load the script of ${selected[0].name}`);
+      }
+      return;
+    }
+    if (selected.length) {
+      loadOpenScadFromShapes(selected, "selection");
+      return;
+    }
+    if (openscadSource === DEFAULT_OPENSCAD_SOURCE && shapesRef.current.some((shape) => !shape.hidden)) {
+      loadOpenScadFromShapes(shapesRef.current, "scene");
+    }
+  }, [loadOpenScadFromShapes, openscadBaseline, openscadSource, openscadTarget]);
+
+  // The viewport only listens for window resizes, so tell it when the OpenSCAD panel
+  // appears or disappears next to it.
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+    return () => window.cancelAnimationFrame(frame);
+  }, [toolbarMode]);
+
+  const renderOpenScadToScene = useCallback(async () => {
+    if (!openScadRuntimeAvailable()) {
+      setOpenscadStatus({ state: "error", message: "OpenSCAD rendering needs the app to be served over http(s)", log: [] });
+      return;
+    }
+    const source = openscadSource;
+    const target = openscadTarget;
+    const sourceProjectId = projectInfoRef.current.projectId;
+    const files = resolveOpenScadImports(source, openscadFiles, shapesRef.current, { localMeshForShape: geometryMeshForShape });
+    setOpenscadStatus({ state: "rendering", log: [] });
+    try {
+      const result = await renderOpenScad(source, {
+        files,
+        onLog: (line) => setOpenscadStatus((current) => (current.state === "rendering" ? { ...current, log: [...current.log, line] } : current)),
+      });
+      if (projectInfoRef.current.projectId !== sourceProjectId) {
+        setOpenscadStatus({ state: "error", message: "The project changed while OpenSCAD was rendering", log: result.log });
+        return;
+      }
+      const current = shapesRef.current;
+      const existing = target?.kind === "update" ? current.find((shape) => shape.id === target.shapeId) ?? null : null;
+      const replacedIds = new Set<string>(
+        existing ? [existing.id] : target?.kind === "replace" && openscadReplaceSources ? target.shapeIds : [],
+      );
+      const singleSource = target?.kind === "replace" && target.shapeIds.length === 1 ? current.find((shape) => shape.id === target.shapeIds[0]) : null;
+      const rendered = canonicalizeShape(openScadShapeFromStl(result.stl, { source, existing, name: singleSource?.name }));
+      const next = existing
+        ? current.map((shape) => (shape.id === existing.id ? rendered : shape))
+        : [...current.filter((shape) => !replacedIds.has(shape.id)), rendered];
+      const triangleCount = rendered.importedMesh?.triangleCount ?? 0;
+      commitShapes(
+        next,
+        rendered.id,
+        existing
+          ? `Updated ${rendered.name} from OpenSCAD (${triangleCount} triangles)`
+          : replacedIds.size
+            ? `Replaced ${replacedIds.size} shape${replacedIds.size === 1 ? "" : "s"} with the OpenSCAD result`
+            : `Added OpenSCAD result (${triangleCount} triangles)`,
+      );
+      setOpenscadTarget({ kind: "update", shapeId: rendered.id });
+      setOpenscadBaseline(source);
+      setOpenscadStatus({ state: "done", log: result.log, durationMs: result.durationMs, triangleCount });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "OpenSCAD render failed";
+      setOpenscadStatus((current) => ({ state: "error", message, log: current.log }));
+    }
+  }, [commitShapes, openscadFiles, openscadReplaceSources, openscadSource, openscadTarget]);
+
+  const openscadTargetDescription = useMemo(() => {
+    if (openscadTarget?.kind === "update") {
+      const shape = shapes.find((candidate) => candidate.id === openscadTarget.shapeId);
+      return shape ? `Render updates “${shape.name}”` : "Render adds a new shape";
+    }
+    if (openscadTarget?.kind === "replace" && openscadReplaceSources) {
+      const count = openscadTarget.shapeIds.filter((id) => shapes.some((shape) => shape.id === id)).length;
+      return count ? `Render replaces ${count} source shape${count === 1 ? "" : "s"} with one mesh` : "Render adds a new shape";
+    }
+    return "Render adds a new shape";
+  }, [openscadReplaceSources, openscadTarget, shapes]);
 
   const removeEdgeTreatment = useCallback(async (optionId: string) => {
     if (!selectedShape) {
@@ -9118,6 +9249,7 @@ export function SketchForgeEditor({
           setWorkplaneMode(false);
           setTopPanel(null);
           setMenuOpen(false);
+          if (mode === "openscad") enterOpenScadMode();
         }}
         canUndo={!projectInteractionActive && (historyIndex > 0 || Boolean(edgeModifier))}
         canRedo={!projectInteractionActive && historyIndex < history.length - 1}
@@ -9182,7 +9314,28 @@ export function SketchForgeEditor({
           setMenuOpen(false);
         }}
       />
-      <div className="editor-body">
+      <div className={`editor-body${toolbarMode === "openscad" ? " openscad-mode" : ""}`}>
+        {toolbarMode === "openscad" ? (
+          <OpenScadWorkspace
+            source={openscadSource}
+            onSourceChange={setOpenscadSource}
+            status={openscadStatus}
+            runtimeAvailable={openScadRuntimeAvailable()}
+            resolvedTheme={resolvedTheme}
+            targetDescription={openscadTargetDescription}
+            selectionCount={selectedShapes.length}
+            showReplaceOption={openscadTarget?.kind === "replace"}
+            replaceSources={openscadReplaceSources}
+            onReplaceSourcesChange={setOpenscadReplaceSources}
+            onRender={() => void renderOpenScadToScene()}
+            onCancel={() => {
+              cancelOpenScadRender();
+              setOpenscadStatus((current) => ({ state: "idle", log: current.log }));
+            }}
+            onGenerateFromScene={() => loadOpenScadFromShapes(shapesRef.current, "scene")}
+            onGenerateFromSelection={() => loadOpenScadFromShapes(selectedShapes, "selection")}
+          />
+        ) : null}
         {toolbarMode === "sketch" && sketchActive ? (
           <SketchWorkspace
             profile={sketchProfile}
@@ -9570,7 +9723,7 @@ function SecondaryToolbar({
     setProjectNameDraft(nextName);
     if (nextName !== projectName) onProjectNameChange?.(nextName);
   };
-  const selectToolbarMode = (mode: "geometry" | "sketch") => {
+  const selectToolbarMode = (mode: ToolbarMode) => {
     setShapesOpen(false);
     setSketchCreateOpen(false);
     setVisibilityOpen(false);
@@ -9935,6 +10088,39 @@ function SecondaryToolbar({
         </div>
       </div>
           </>
+        ) : toolbarMode === "openscad" ? (
+          <div className="openscad-toolbar-ribbon" aria-label="OpenSCAD toolbar">
+            {onHome ? (
+              <div className="tool-group editor-nav-group">
+                <div className="toolbar-section toolbar-home-section">
+                  <div className="toolbar-section-label">Home</div>
+                  <div className="toolbar-section-tools">
+                    <button className="toolbar-icon editor-home-control" aria-label="Home dashboard" title="Home dashboard" onClick={onHome}>
+                      <ToolbarHomeIcon />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+            <div className="toolbar-section openscad-help-section">
+              <div className="toolbar-section-label">OpenSCAD</div>
+              <div className="openscad-help">
+                <span>Edit the script on the left, then press <kbd>Ctrl/Cmd</kbd> + <kbd>Enter</kbd> or <strong>Render</strong> to build it into the scene.</span>
+                <span>Select shapes in Geometry mode first to turn them into code; select a rendered OpenSCAD shape to edit its script again.</span>
+              </div>
+            </div>
+            <div className="toolbar-section toolbar-actions-section">
+              <div className="toolbar-section-label">Manage</div>
+              <div className="action-buttons">
+                <button className="action-icon-button" aria-label="Export" title="Export" onClick={() => onTopPanel("export")}>
+                  <ToolbarVectorExportIcon />
+                </button>
+                <button className="action-icon-button" aria-label="Workspace settings" title="Workspace settings" onClick={() => window.dispatchEvent(new Event("sketchforge:open-workspace-settings"))}>
+                  <ToolbarSettingsIcon />
+                </button>
+              </div>
+            </div>
+          </div>
         ) : (
           <div className="sketch-toolbar-ribbon" aria-label="Sketch toolbar">
             {sketchActive ? (
@@ -10114,6 +10300,15 @@ function SecondaryToolbar({
           onClick={() => selectToolbarMode("sketch")}
         >
           Sketch
+        </button>
+        <button
+          className={toolbarMode === "openscad" ? "active" : ""}
+          type="button"
+          role="tab"
+          aria-selected={toolbarMode === "openscad"}
+          onClick={() => selectToolbarMode("openscad")}
+        >
+          OpenSCAD
         </button>
       </div>
     </div>

@@ -3403,6 +3403,237 @@ button {
   background: var(--background);
 }
 
+/* OpenSCAD workspace (fork feature, see FORK.md) */
+.openscad-workspace {
+  display: flex;
+  flex: 0 0 min(46vw, 640px);
+  min-width: 320px;
+  height: calc(100vh - var(--editor-toolbar-height));
+  flex-direction: column;
+  min-height: 0;
+  background: #f8fbfc;
+  border-right: 1px solid #d2dce5;
+  font-family: var(--font-ui);
+}
+
+.openscad-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #e1e8ee;
+}
+
+.openscad-toolbar-group {
+  display: flex;
+  gap: 6px;
+}
+
+.openscad-button {
+  padding: 6px 12px;
+  color: #294a63;
+  background: #ffffff;
+  border: 1px solid #c9d5df;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.openscad-button:hover:not(:disabled) {
+  background: #eef5fa;
+}
+
+.openscad-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.openscad-button.primary {
+  color: #ffffff;
+  background: #159fd0;
+  border-color: #118ab5;
+}
+
+.openscad-button.primary:hover:not(:disabled) {
+  background: #118ab5;
+}
+
+.openscad-target {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  color: #607589;
+  font-size: 12px;
+  border-bottom: 1px solid #e1e8ee;
+}
+
+.openscad-replace-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.openscad-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.openscad-editor .cm-editor {
+  height: 100%;
+  font-size: 13px;
+}
+
+.openscad-editor .cm-scroller {
+  font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+.openscad-editor .cm-openscad-error-line {
+  background: rgba(220, 53, 69, 0.14);
+}
+
+.openscad-status {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  color: #294a63;
+  font-size: 12px;
+  border-top: 1px solid #e1e8ee;
+}
+
+.openscad-status.error {
+  color: #b42318;
+  background: rgba(220, 53, 69, 0.08);
+}
+
+.openscad-status.done {
+  color: #1d7a4d;
+}
+
+.openscad-log {
+  flex: 0 0 auto;
+  max-height: 160px;
+  margin: 0;
+  padding: 8px 12px;
+  overflow: auto;
+  color: #46596b;
+  background: #eef2f5;
+  font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  border-top: 1px solid #e1e8ee;
+}
+
+.openscad-toolbar-ribbon {
+  display: flex;
+  width: 100%;
+  align-items: stretch;
+}
+
+.openscad-help-section {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.openscad-help {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px 12px;
+  color: #607589;
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.openscad-help kbd {
+  padding: 0 4px;
+  border: 1px solid #c9d5df;
+  border-radius: 3px;
+  background: #ffffff;
+  font-size: 11px;
+}
+
+html[data-theme="dark"] .openscad-workspace,
+html[data-theme="dark"] .openscad-log {
+  color: #d2e0ea;
+  background: #131c24;
+  border-color: #30424f;
+}
+
+html[data-theme="dark"] .openscad-toolbar,
+html[data-theme="dark"] .openscad-target,
+html[data-theme="dark"] .openscad-status,
+html[data-theme="dark"] .openscad-log {
+  border-color: #30424f;
+}
+
+html[data-theme="dark"] .openscad-target,
+html[data-theme="dark"] .openscad-help,
+html[data-theme="dark"] .openscad-log {
+  color: #b7c9d6;
+}
+
+html[data-theme="dark"] .openscad-status {
+  color: #d2e0ea;
+}
+
+html[data-theme="dark"] .openscad-status.error {
+  color: #ff8a80;
+}
+
+html[data-theme="dark"] .openscad-status.done {
+  color: #7fd6a4;
+}
+
+html[data-theme="dark"] .openscad-button {
+  color: #d2e0ea;
+  background: #1f2e3a;
+  border-color: #3a4d5b;
+}
+
+html[data-theme="dark"] .openscad-button:hover:not(:disabled) {
+  background: #273946;
+}
+
+html[data-theme="dark"] .openscad-button.primary {
+  color: #ffffff;
+  background: #159fd0;
+  border-color: #118ab5;
+}
+
+html[data-theme="dark"] .openscad-help kbd {
+  background: #1f2e3a;
+  border-color: #3a4d5b;
+}
+
+@media (max-width: 980px) {
+  .editor-body.openscad-mode {
+    flex-direction: column;
+  }
+
+  .openscad-workspace {
+    flex: 0 0 55%;
+    width: 100%;
+    min-width: 0;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid #d2dce5;
+  }
+
+  .editor-body.openscad-mode .workplane-stage {
+    height: auto;
+  }
+}
+
 .sketch-workspace-stage {
   position: relative;
   flex: 1;

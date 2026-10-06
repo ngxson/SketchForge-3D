@@ -280,6 +280,12 @@ export type WorkplaneShape = {
   groupedBaseDepth?: number;
   groupedBaseHeight?: number;
   groupOperation?: "group" | "intersection";
+  /**
+   * OpenSCAD script that produced this mesh (fork feature, see FORK.md). Present only on
+   * shapes rendered from the OpenSCAD workspace; selecting such a shape and opening the
+   * OpenSCAD tab loads the script for editing. Persists through IndexedDB and .skf.
+   */
+  openscadSource?: string;
   locked?: boolean;
   hidden?: boolean;
 };

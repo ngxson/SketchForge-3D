@@ -7,6 +7,7 @@ const desktopDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(desktopDir, "..", "..");
 const nextBin = path.join(repoRoot, "node_modules", "next", "dist", "bin", "next");
 const copyOcctScript = path.join(repoRoot, "scripts", "copy-occt-wasm.mjs");
+const copyOpenScadScript = path.join(repoRoot, "scripts", "copy-openscad-wasm.mjs");
 
 function runNode(args, env = process.env) {
   const result = spawnSync(process.execPath, args, {
@@ -26,6 +27,7 @@ function runNode(args, env = process.env) {
 }
 
 runNode([copyOcctScript]);
+runNode([copyOpenScadScript]);
 runNode([nextBin, "build", "apps/web"], {
   ...process.env,
   SKETCHFORGE_DOCKER_BUILD: "true",

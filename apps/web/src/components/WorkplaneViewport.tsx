@@ -2934,6 +2934,8 @@ export function WorkplaneViewport({
     };
     perfRef.current.lastSample = performance.now();
     resetCamera(state);
+    // Orthographic is the default projection; O switches to perspective.
+    toggleCameraProjection(state);
     rebuildShapes(state, shapesRef.current, renderSelectionIds(), true, false, placementWorkplaneRef.current);
 
     const animate = () => {

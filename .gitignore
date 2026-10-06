@@ -48,5 +48,8 @@ Thumbs.db
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
 
+# Staged OpenSCAD runtime (downloaded by scripts/copy-openscad-wasm.mjs)
+apps/web/public/openscad/
+
 # Staged occt-wasm runtime (copied from node_modules by scripts/copy-occt-wasm.mjs)
 apps/web/public/occt/
