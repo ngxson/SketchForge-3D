@@ -107,6 +107,11 @@ import { DEFAULT_OPENSCAD_SOURCE, isOpenScadShape, openScadShapeFromStl } from "
 import { cancelOpenScadRender, openScadRuntimeAvailable, renderOpenScad } from "@/lib/openscadRuntime";
 import type { OpenScadInputFile } from "@/lib/openscadTypes";
 import { OpenScadWorkspace, type OpenScadRenderStatus } from "./OpenScadWorkspace";
+import { boxGeometryOptionsFromShape, createBoxGeometry } from "@/lib/boxGeometry";
+import { normalizeLatchBoxParams, validateLatchBoxParams, type LatchBoxParams } from "@/lib/latchBox";
+import { buildLatchBoxParts } from "@/lib/latchBoxRuntime";
+import { LATCH_BOX_PART_GAP, latchBoxShapeFromMesh } from "@/lib/latchBoxShapes";
+import { LATCH_BOX_ASSET_ID } from "@/lib/shapeCatalog";
 import { exportMeshesToStl } from "@/lib/stlExport";
 import { importedShapeFromSvg, invalidSvgMeshReason } from "@/lib/svgImport";
 import { toSvgProjection, type SvgProjectionLayer } from "@/lib/svgExport";
@@ -2173,9 +2178,7 @@ function geometryMeshForShape(shape: WorkplaneShape): MeshData | null {
 
   switch (shape.kind) {
     case "box":
-      geometry = shape.radius && shape.radius > 0
-        ? new RoundedBoxGeometry(width, height, depth, Math.max(1, shape.steps ?? 10), shape.radius)
-        : new THREE.BoxGeometry(width, height, depth);
+      geometry = createBoxGeometry(boxGeometryOptionsFromShape(shape, width, depth, height));
       break;
     case "cylinder":
       geometry = new THREE.CylinderGeometry(1, 1, height, shape.sides ?? 96, shape.segments ?? 1);
@@ -5549,6 +5552,8 @@ export function SketchForgeEditor({
   const sketchRevolvePreviewRequestRef = useRef(0);
   const sketchRevolveUpdateRequestRef = useRef(new Map<string, number>());
   const sketchRevolveUpdateTimerRef = useRef(new Map<string, number>());
+  const latchBoxUpdateRequestRef = useRef(new Map<string, number>());
+  const latchBoxUpdateTimerRef = useRef(new Map<string, number>());
   const [sketchTool, setSketchTool] = useState<SketchTool>("line");
   const [sketchProfile, setSketchProfile] = useState<SketchProfile>(() => emptySketchProfile());
   const [sketchHistory, setSketchHistory] = useState<SketchProfile[]>([emptySketchProfile()]);
@@ -7140,8 +7145,79 @@ export function SketchForgeEditor({
     };
   }, []);
 
+  // ---- Latch & screw box generator (fork feature, see FORK.md) ----
+
+  const addLatchBox = useCallback(async (point?: PlacementPoint) => {
+    const params = normalizeLatchBoxParams(null);
+    const setId = createLocalId("latch-box-set");
+    const sourceProjectId = projectInfoRef.current.projectId;
+    setNotice("Building latch box…");
+    try {
+      const { body, cover, durationMs } = await buildLatchBoxParts(params);
+      if (projectInfoRef.current.projectId !== sourceProjectId) return;
+      const workplane = placementWorkplaneRef.current;
+      const origin = point ?? workplane.origin;
+      const offset = params.W / 2 + LATCH_BOX_PART_GAP;
+      const placed = [
+        latchBoxShapeFromMesh("body", body, { setId, params }),
+        latchBoxShapeFromMesh("cover", cover, { setId, params }),
+      ].map((shape, index) => {
+        const patch = placementPatchForNewShape(shape, workplane, origin);
+        return canonicalizeShape({ ...shape, ...patch, x: patch.x + (index === 0 ? -offset : offset) });
+      });
+      // Select only the body so the inspector shows the generator parameters right away.
+      commitShapes([...shapesRef.current, ...placed], placed[0].id, `Latch box added (${Math.round(durationMs)} ms)`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not build the latch box");
+    }
+  }, [commitShapes]);
+
+  const scheduleLatchBoxUpdate = useCallback((setId: string, params: LatchBoxParams) => {
+    // Show the new parameters immediately (no history entry); the geometry follows after a debounce.
+    const withParams = shapesRef.current.map((shape) =>
+      shape.latchBox?.setId === setId ? { ...shape, latchBox: { ...shape.latchBox, params } } : shape,
+    );
+    shapesRef.current = withParams;
+    setShapes(withParams);
+    const errors = validateLatchBoxParams(params);
+    if (errors.length) {
+      setNotice(errors[0]);
+      return;
+    }
+    const previousTimer = latchBoxUpdateTimerRef.current.get(setId);
+    if (previousTimer !== undefined) window.clearTimeout(previousTimer);
+    const requestId = (latchBoxUpdateRequestRef.current.get(setId) ?? 0) + 1;
+    latchBoxUpdateRequestRef.current.set(setId, requestId);
+    const timer = window.setTimeout(() => {
+      latchBoxUpdateTimerRef.current.delete(setId);
+      setNotice("Rebuilding latch box…");
+      void buildLatchBoxParts(params)
+        .then(({ body, cover, durationMs }) => {
+          if (latchBoxUpdateRequestRef.current.get(setId) !== requestId) return;
+          let changed = false;
+          const next = shapesRef.current.map((shape) => {
+            if (shape.latchBox?.setId !== setId) return shape;
+            changed = true;
+            const mesh = shape.latchBox.part === "body" ? body : cover;
+            return canonicalizeShape(latchBoxShapeFromMesh(shape.latchBox.part, mesh, { setId, params }, { existing: shape }));
+          });
+          if (changed) commitShapes(next, selectedIdsRef.current, `Latch box updated (${Math.round(durationMs)} ms)`);
+        })
+        .catch((error) => {
+          if (latchBoxUpdateRequestRef.current.get(setId) === requestId) {
+            setNotice(error instanceof Error ? error.message : "The latch box could not be rebuilt");
+          }
+        });
+    }, 150);
+    latchBoxUpdateTimerRef.current.set(setId, timer);
+  }, [commitShapes]);
+
   const addShape = useCallback(
     (asset: ShapeAsset, point?: PlacementPoint) => {
+      if (asset.id === LATCH_BOX_ASSET_ID) {
+        void addLatchBox(point);
+        return;
+      }
       const shape = makeShapeFromAsset(asset, undefined, workspaceSettingsRef.current.shapeCustomizations[asset.kind]);
       const nextShape = {
         ...shape,
@@ -7149,7 +7225,7 @@ export function SketchForgeEditor({
       };
       commitShapes([...shapes, nextShape], nextShape.id, `${asset.name} added`);
     },
-    [commitShapes, placementWorkplane, shapes],
+    [addLatchBox, commitShapes, placementWorkplane, shapes],
   );
 
   const scheduleRevolveShapeUpdate = useCallback((id: string, settings: SketchRevolveSettings) => {
@@ -7218,6 +7294,13 @@ export function SketchForgeEditor({
           return;
         }
       }
+      if (cleanedPatch.latchBox) {
+        const source = shapesRef.current.find((shape) => shape.id === id);
+        if (source?.latchBox) {
+          scheduleLatchBoxUpdate(source.latchBox.setId, normalizeLatchBoxParams(cleanedPatch.latchBox.params));
+          return;
+        }
+      }
       const applyPatch = (current: WorkplaneShape[]) => {
         let changed = false;
         const next = current.map((shape) => {
@@ -7255,7 +7338,7 @@ export function SketchForgeEditor({
         commitShapes(next, selectedIds);
       }
     },
-    [commitShapes, scheduleRevolveShapeUpdate, selectedIds, shapes],
+    [commitShapes, scheduleLatchBoxUpdate, scheduleRevolveShapeUpdate, selectedIds, shapes],
   );
 
   const deleteSelected = useCallback(() => {

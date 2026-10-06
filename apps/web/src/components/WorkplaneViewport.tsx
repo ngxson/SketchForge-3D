@@ -6,7 +6,7 @@ import * as THREE from "three";
 import { Brush, Evaluator, HOLLOW_INTERSECTION } from "three-bvh-csg";
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
+import { boxGeometryOptionsFromShape, boxIsPlain, createBoxGeometry } from "@/lib/boxGeometry";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
@@ -999,7 +999,7 @@ function shapeGeometrySignature(shape: WorkplaneShape): string {
     });
   }
 
-  if (shape.kind === "box" && !(shape.radius && shape.radius > 0)) {
+  if (boxIsPlain(shape)) {
     return JSON.stringify({ kind: "box", taper });
   }
   if (shape.kind === "cylinder") {
@@ -1015,6 +1015,9 @@ function shapeGeometrySignature(shape: WorkplaneShape): string {
   return JSON.stringify({
     kind: shape.kind,
     geometryRevision: shape.kind === "pyramid" ? 2 : undefined,
+    boxCorners: shape.boxCorners,
+    boxWall: shape.boxWall,
+    boxFloor: shape.boxFloor,
     width: shapeWidth(shape),
     depth: shapeDepth(shape),
     height: shape.height,
@@ -6038,7 +6041,7 @@ function syncShapeObjectDimensions(object: THREE.Group, shape: WorkplaneShape) {
       shape.height / Math.max(0.001, shape.importedMesh.baseHeight),
       depth / Math.max(0.001, shape.importedMesh.baseDepth),
     );
-  } else if (shape.kind === "box" && !(shape.radius && shape.radius > 0)) {
+  } else if (boxIsPlain(shape)) {
     scale = new THREE.Vector3(width, shape.height, depth);
   } else if (shape.kind === "cylinder" || shape.kind === "polygon") {
     scale = new THREE.Vector3(width / 2, shape.height, depth / 2);
@@ -7392,22 +7395,26 @@ function createShapeObject(
   const geometryCacheKey = shapeGeometrySignature(shape);
 
   switch (shape.kind) {
-    case "box":
+    case "box": {
+      // Plain cuboids share one unit cube scaled per shape; rounded/hollow boxes (fork
+      // feature, see boxGeometry.ts) are built at size and cached by their signature.
+      const plainBox = boxIsPlain(shape);
       addMesh(
         group,
         sharedShapeGeometry(
           geometryCacheKey,
-          () => shape.radius && shape.radius > 0
-            ? new RoundedBoxGeometry(width, height, depth, Math.max(1, shape.steps ?? 10), shape.radius)
-            : new THREE.BoxGeometry(1, 1, 1),
+          () => plainBox
+            ? new THREE.BoxGeometry(1, 1, 1)
+            : createBoxGeometry(boxGeometryOptionsFromShape(shape, width, depth, height)),
         ),
         shape.imagePlate && !shape.hole ? createImagePlateMaterials(shape, material, onTextureReady) : material,
         shape,
         undefined,
         undefined,
-        shape.radius && shape.radius > 0 ? undefined : new THREE.Vector3(width, height, depth),
+        plainBox ? new THREE.Vector3(width, height, depth) : undefined,
       );
       break;
+    }
     case "cylinder":
       addMesh(group, sharedShapeGeometry(geometryCacheKey, () => new THREE.CylinderGeometry(1, 1, 1, shape.sides ?? 96, shape.segments ?? 1)), material, shape, undefined, undefined, new THREE.Vector3(width / 2, height, depth / 2));
       break;

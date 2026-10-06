@@ -3403,6 +3403,68 @@ button {
   background: var(--background);
 }
 
+/* Inspector additions (fork features, see FORK.md): toggles, hints, latch box errors */
+.toggle-property {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: #637286;
+  font-size: 15px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.toggle-property input {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: #159fd0;
+  cursor: pointer;
+}
+
+.toggle-property input:disabled {
+  cursor: default;
+  opacity: 0.52;
+}
+
+.property-hint {
+  margin: 0 0 6px;
+  color: #7b8a99;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.latch-box-errors {
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  color: #a63d1c;
+  background: rgba(220, 53, 69, 0.08);
+  border: 1px solid rgba(220, 53, 69, 0.25);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.latch-box-errors p {
+  margin: 0;
+}
+
+.latch-box-errors p + p {
+  margin-top: 4px;
+}
+
+html[data-theme="dark"] .toggle-property,
+html[data-theme="dark"] .property-hint {
+  color: #afc3d0;
+}
+
+html[data-theme="dark"] .latch-box-errors {
+  color: #f0906e;
+  background: rgba(240, 144, 110, 0.12);
+  border-color: rgba(240, 144, 110, 0.3);
+}
+
 /* OpenSCAD workspace (fork feature, see FORK.md) */
 .openscad-workspace {
   display: flex;

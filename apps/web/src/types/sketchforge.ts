@@ -1,3 +1,5 @@
+import type { LatchBoxShapeData } from "@/lib/latchBoxTypes";
+
 export type ShapeKind =
   | "box"
   | "cylinder"
@@ -286,6 +288,16 @@ export type WorkplaneShape = {
    * OpenSCAD tab loads the script for editing. Persists through IndexedDB and .skf.
    */
   openscadSource?: string;
+  /**
+   * Box options (fork feature, see FORK.md). `boxCorners` chooses which edges `radius`
+   * rounds: every edge (default) or only the four vertical ones. `boxWall` > 0 makes the
+   * box hollow with an open top; `boxFloor` is the bottom thickness (defaults to the wall).
+   */
+  boxCorners?: "all" | "vertical";
+  boxWall?: number;
+  boxFloor?: number;
+  /** Latch & screw box generator parameters (fork feature, see FORK.md). Set on generated mesh parts. */
+  latchBox?: LatchBoxShapeData;
   locked?: boolean;
   hidden?: boolean;
 };

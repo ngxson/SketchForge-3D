@@ -19,6 +19,8 @@ import type { ShapeAsset, ShapeCustomization, ShapeKind, WorkplaneShape } from "
 
 export type ToolbarShapeAsset = ShapeAsset & { menuIcon: string };
 
+export const LATCH_BOX_ASSET_ID = "latch-box";
+
 export const toolbarShapeAssets: ToolbarShapeAsset[] = [
   { id: "box", name: "Box", src: "assets/sketchforge/shape-icons-gray/box.png", menuIcon: "assets/sketchforge/shape-icons-gray/box.png", kind: "box", color: "#d41721" },
   { id: "cylinder", name: "Cylinder", src: "assets/sketchforge/shape-icons-gray/cylinder.png", menuIcon: "assets/sketchforge/shape-icons-gray/cylinder.png", kind: "cylinder", color: "#d97813" },
@@ -32,6 +34,9 @@ export const toolbarShapeAssets: ToolbarShapeAsset[] = [
   { id: "torus", name: "Torus", src: "assets/sketchforge/shape-icons-gray/torus.png", menuIcon: "assets/sketchforge/shape-icons-gray/torus.png", kind: "torus", color: "#0098c7" },
   { id: "tube", name: "Tube", src: "assets/sketchforge/shape-icons-gray/tube.png", menuIcon: "assets/sketchforge/shape-icons-gray/tube.png", kind: "tube", color: "#ce7013" },
   { id: "gear", name: "Gear", src: "assets/sketchforge/gear-types/spur.png", menuIcon: "assets/sketchforge/gear-types/spur.png", kind: "gear", color: "#6f7f8d" },
+  // Fork feature (see FORK.md): generated parametric enclosure. The editor's addShape
+  // intercepts this id and builds the body + cover asynchronously.
+  { id: LATCH_BOX_ASSET_ID, name: "Latch Box", src: "assets/sketchforge/shape-icons-gray/box.png", menuIcon: "assets/sketchforge/shape-icons-gray/box.png", kind: "mesh", color: "#7d93b8" },
 ];
 
 export function shapeAssetDefaultDimensions(kind: ShapeKind) {
@@ -91,6 +96,11 @@ export function sceneShape(shape: Partial<WorkplaneShape> & Pick<WorkplaneShape,
     rotationX: shape.rotationX ?? 0,
     rotationZ: shape.rotationZ ?? 0,
     radius: shape.radius,
+    boxCorners: shape.boxCorners,
+    boxWall: shape.boxWall,
+    boxFloor: shape.boxFloor,
+    latchBox: shape.latchBox,
+    openscadSource: shape.openscadSource,
     steps: shape.steps,
     sides: shape.sides,
     bevel: shape.bevel,

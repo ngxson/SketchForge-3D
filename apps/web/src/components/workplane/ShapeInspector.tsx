@@ -23,6 +23,10 @@ import {
 } from "@/lib/gearGeometry";
 import { displayStepFromMillimeters, displayToMillimeters, formatMeasurementNumber, lengthDisplayUnit, millimetersToDisplay, parseMeasurementInput } from "@/lib/measurementUnits";
 import { resizedShapeSize, shapeDepth, shapeHasTaper, shapeOverallFootprintDimensions, shapeTaperDimensions, shapeWidth } from "@/lib/workplaneShapes";
+import { boxCornerStyle, maxBoxFloor, maxBoxWall } from "@/lib/boxGeometry";
+import { validateLatchBoxParams } from "@/lib/latchBox";
+import { latchBoxPropertyGroups, type LatchBoxPropertyGroup } from "@/lib/latchBoxInspector";
+import { isLatchBoxShape } from "@/lib/latchBoxShapes";
 import { normalizeSketchRevolveSettings } from "@/lib/sketchRevolve";
 import { MAX_HIGH_RESOLUTION_SIDES } from "@/lib/workplaneSettings";
 import type { GearType, GridSize, MeasurementAccuracy, WorkplaneShape, WorkplaneWorkspaceSettings } from "@/types/sketchforge";
@@ -60,30 +64,33 @@ const SOLID_COLORS = [
   "#111111",
 ];
 const TEXT_FONT_OPTIONS = ["Multilanguage", "Sans", "Serif", "Script", "Monospace", "Rounded", "Stencil"];
+const BOX_CORNER_LABELS = { all: "All edges", vertical: "Vertical edges" } as const;
 const GEAR_TYPE_OPTIONS: Array<{ value: GearType; label: string }> = [
   { value: "spur", label: "Spur gear" },
   { value: "helical", label: "Helical gear" },
   { value: "bevel", label: "Bevel gear" },
 ];
 
-type RangePropertyConfig = {
+export type RangePropertyConfig = {
   type?: "range";
   label: string;
   value: number;
   min: number;
   max: number;
   step?: number;
+  /** Overrides the label-based unit detection (fork addition used by generated shapes). */
+  unit?: "mm" | "none";
   onChange: (value: number) => void;
 };
 
-type TextPropertyConfig = {
+export type TextPropertyConfig = {
   type: "text";
   label: string;
   value: string;
   onChange: (value: string) => void;
 };
 
-type SelectPropertyConfig = {
+export type SelectPropertyConfig = {
   type: "select";
   label: string;
   value: string;
@@ -91,7 +98,14 @@ type SelectPropertyConfig = {
   onChange: (value: string) => void;
 };
 
-type ShapePropertyConfig = RangePropertyConfig | TextPropertyConfig | SelectPropertyConfig;
+export type TogglePropertyConfig = {
+  type: "toggle";
+  label: string;
+  value: boolean;
+  onChange: (value: boolean) => void;
+};
+
+export type ShapePropertyConfig = RangePropertyConfig | TextPropertyConfig | SelectPropertyConfig | TogglePropertyConfig;
 export type ShapeInspectorUpdateOptions = { resizeAxis?: "width" | "depth" | "height" };
 type ShapeInspectorUpdate = (patch: Partial<WorkplaneShape>, options?: ShapeInspectorUpdateOptions) => void;
 
@@ -105,7 +119,7 @@ function formatPropertyNumber(value: number, accuracy: MeasurementAccuracy, step
 }
 
 function propertyUsesLengthUnit(label: string) {
-  return ["Radius", "Length", "Width", "Height", "Bevel", "Top Radius", "Base Radius", "Thickness", "Tooth Size", "Tooth Width", "Center Hole", "Top Length", "Top Width", "Bottom Length", "Bottom Width"].includes(label);
+  return ["Radius", "Length", "Width", "Height", "Bevel", "Top Radius", "Base Radius", "Thickness", "Tooth Size", "Tooth Width", "Center Hole", "Top Length", "Top Width", "Bottom Length", "Bottom Width", "Corner Radius", "Wall", "Floor"].includes(label);
 }
 
 function getShapePropertiesWithAppLimits(shape: WorkplaneShape, onUpdate: ShapeInspectorUpdate, textWidthMax = 260): ShapePropertyConfig[] {
@@ -168,7 +182,18 @@ function getShapePropertiesWithAppLimits(shape: WorkplaneShape, onUpdate: ShapeI
   }
 
   if (shape.kind === "box") {
+    // Fork feature (see FORK.md): corner rounding style and radius live in the main list;
+    // hollow-box settings are in their own card.
+    const cornerMax = Math.max(0, Math.min(width, depth, shape.height) / 2);
     return [
+      {
+        type: "select",
+        label: "Rounding",
+        value: boxCornerStyle(shape) === "vertical" ? BOX_CORNER_LABELS.vertical : BOX_CORNER_LABELS.all,
+        options: [BOX_CORNER_LABELS.all, BOX_CORNER_LABELS.vertical],
+        onChange: (value) => onUpdate({ boxCorners: value === BOX_CORNER_LABELS.vertical ? "vertical" : "all" }),
+      },
+      { label: "Corner Radius", value: shape.radius ?? 0, min: 0, max: cornerMax, step: 0.1, onChange: (radius) => onUpdate({ radius: Math.min(radius, cornerMax) }) },
       { label: "Length", value: depth, min: MIN_SHAPE_SIZE, max: 160, onChange: setDepth },
       { label: "Width", value: width, min: MIN_SHAPE_SIZE, max: 160, onChange: setWidth },
       { label: "Height", value: shape.height, min: MIN_SHAPE_SIZE, max: 160, onChange: setHeight },
@@ -357,7 +382,7 @@ function getShapeProperties(shape: WorkplaneShape, onUpdate: ShapeInspectorUpdat
   const properties = getShapePropertiesWithAppLimits(shape, onUpdate, customLimit ?? 260);
   if (customLimit === undefined) return properties;
   return properties.map((property) => {
-    if (property.type === "text" || property.type === "select") return property;
+    if (property.type === "text" || property.type === "select" || property.type === "toggle") return property;
     if (["Length", "Width", "Height"].includes(property.label)) return { ...property, max: customLimit };
     if (["Top Radius", "Base Radius"].includes(property.label)) return { ...property, max: customLimit / 2 };
     return property;
@@ -438,6 +463,30 @@ export function ShapeInspector({
   const inspectorRef = useRef<HTMLElement>(null);
   const [propertiesOpen, setPropertiesOpen] = useState(true);
   const [taperOpen, setTaperOpen] = useState(false);
+  const [hollowOpen, setHollowOpen] = useState(() => Boolean(shape.boxWall && shape.boxWall > 0));
+  // Fork features (see FORK.md): hollow boxes and the latch box generator.
+  const hollowProperties: ShapePropertyConfig[] = shape.kind === "box" ? [
+    {
+      label: "Wall",
+      value: shape.boxWall ?? 0,
+      min: 0,
+      max: maxBoxWall(shapeWidth(shape), shapeDepth(shape)),
+      step: 0.1,
+      onChange: (boxWall) => onUpdate({ boxWall: boxWall > 0 ? boxWall : undefined }),
+    },
+    {
+      label: "Floor",
+      value: shape.boxFloor ?? shape.boxWall ?? 0,
+      min: 0,
+      max: maxBoxFloor(shape.height),
+      step: 0.1,
+      onChange: (boxFloor) => onUpdate({ boxFloor }),
+    },
+  ] : [];
+  const latchBoxGroups: LatchBoxPropertyGroup[] | null = isLatchBoxShape(shape)
+    ? latchBoxPropertyGroups(shape.latchBox.params, (params) => onUpdate({ latchBox: { ...shape.latchBox, params } }))
+    : null;
+  const latchBoxErrors = isLatchBoxShape(shape) ? validateLatchBoxParams(shape.latchBox.params) : [];
   const [gearTeethOpen, setGearTeethOpen] = useState(true);
   const [gearHelixOpen, setGearHelixOpen] = useState(true);
   const [colorOpen, setColorOpen] = useState(false);
@@ -568,6 +617,16 @@ export function ShapeInspector({
         </button>
       ) : null}
 
+      {latchBoxGroups ? (
+        <LatchBoxCards
+          shapeId={shape.id}
+          groups={latchBoxGroups}
+          errors={latchBoxErrors}
+          workspace={workspace}
+          disabled={locked}
+          onInteractionActiveChange={onInteractionActiveChange}
+        />
+      ) : (
       <div className={`property-card ${propertiesOpen ? "" : "collapsed"}`}>
         <button
           className="property-card-header"
@@ -592,7 +651,28 @@ export function ShapeInspector({
           </div>
         ) : null}
       </div>
-      {shape.kind !== "gear" ? (
+      )}
+      {shape.kind === "box" ? (
+        <div className={`property-card ${hollowOpen ? "" : "collapsed"}`}>
+          <button
+            className="property-card-header"
+            type="button"
+            aria-expanded={hollowOpen}
+            aria-controls={`hollow-${shape.id}`}
+            onClick={() => setHollowOpen((open) => !open)}
+          >
+            <span>Hollow</span>
+            <ChevronUp className={hollowOpen ? "" : "collapsed"} size={25} strokeWidth={2.8} />
+          </button>
+          {hollowOpen ? (
+            <div className="property-list" id={`hollow-${shape.id}`}>
+              <p className="property-hint">Wall above 0 opens the top and keeps a floor of the given thickness. Rounded corners follow the wall inside.</p>
+              <ShapePropertyRows properties={hollowProperties} workspace={workspace} disabled={locked} onInteractionActiveChange={onInteractionActiveChange} />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {shape.kind !== "gear" && !latchBoxGroups ? (
         <div className={`property-card ${taperOpen ? "" : "collapsed"}`}>
           <button
             className="property-card-header"
@@ -658,7 +738,59 @@ export function ShapeInspector({
   );
 }
 
-function ShapePropertyRows({
+function LatchBoxCards({
+  shapeId,
+  groups,
+  errors,
+  workspace,
+  disabled,
+  onInteractionActiveChange,
+}: {
+  shapeId: string;
+  groups: LatchBoxPropertyGroup[];
+  errors: string[];
+  workspace: WorkplaneWorkspaceSettings;
+  disabled?: boolean;
+  onInteractionActiveChange?: (active: boolean) => void;
+}) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  return (
+    <>
+      {errors.length ? (
+        <div className="latch-box-errors" role="alert">
+          {errors.map((error) => (
+            <p key={error}>{error}</p>
+          ))}
+        </div>
+      ) : null}
+      {groups.map((group) => {
+        const open = !collapsed[group.title];
+        const id = `latch-box-${group.title.replace(/\W+/g, "-").toLowerCase()}-${shapeId}`;
+        return (
+          <div key={group.title} className={`property-card ${open ? "" : "collapsed"}`}>
+            <button
+              className="property-card-header"
+              type="button"
+              aria-expanded={open}
+              aria-controls={id}
+              onClick={() => setCollapsed((current) => ({ ...current, [group.title]: open }))}
+            >
+              <span>{group.title}</span>
+              <ChevronUp className={open ? "" : "collapsed"} size={25} strokeWidth={2.8} />
+            </button>
+            {open ? (
+              <div className="property-list" id={id}>
+                <ShapePropertyRows properties={group.properties} workspace={workspace} disabled={disabled} onInteractionActiveChange={onInteractionActiveChange} />
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+export function ShapePropertyRows({
   properties,
   workspace,
   disabled,
@@ -675,6 +807,9 @@ function ShapePropertyRows({
     }
     if (property.type === "select") {
       return <SelectProperty key={property.label} {...property} disabled={disabled} />;
+    }
+    if (property.type === "toggle") {
+      return <ToggleProperty key={property.label} {...property} disabled={disabled} />;
     }
     return <RangeProperty key={property.label} {...property} workspace={workspace} disabled={disabled} onInteractionActiveChange={onInteractionActiveChange} />;
   });
@@ -724,13 +859,14 @@ function RangeProperty({
   min,
   max,
   step = 0.01,
+  unit: unitOverride,
   workspace,
   disabled,
   onChange,
   onInteractionActiveChange,
 }: RangePropertyConfig & { workspace: WorkplaneWorkspaceSettings; disabled?: boolean; onInteractionActiveChange?: (active: boolean) => void }) {
   const allowsAboveSliderMax = label === "Length" || label === "Width" || label === "Height" || label.endsWith(" Length") || label.endsWith(" Width");
-  const isLength = propertyUsesLengthUnit(label);
+  const isLength = unitOverride ? unitOverride === "mm" : propertyUsesLengthUnit(label);
   const accuracy = workspace.accuracy;
   const actualValue = Math.max(min, Number.isFinite(value) ? value : min);
   const controlValue = isLength ? millimetersToDisplay(actualValue, workspace) : actualValue;
@@ -819,6 +955,15 @@ function TextProperty({ label, value, disabled, onChange, onInteractionActiveCha
         onBlur={() => onInteractionActiveChange?.(false)}
         onChange={(event) => onChange(event.currentTarget.value)}
       />
+    </label>
+  );
+}
+
+function ToggleProperty({ label, value, disabled, onChange }: TogglePropertyConfig & { disabled?: boolean }) {
+  return (
+    <label className="toggle-property">
+      <span>{label}</span>
+      <input type="checkbox" checked={value} disabled={disabled} onChange={(event) => onChange(event.currentTarget.checked)} />
     </label>
   );
 }

@@ -128,7 +128,7 @@ translate([x, -z, elevation + h/2]) [rotate([rx,0,0])] [rotate([0,0,ry])] [rotat
 - `npm test` → 50 files / 297 tests pass; `npm run typecheck` passes.
 - Verified manually in headless Chrome (DevTools protocol script, not committed) against `npm run dev`: tab appears; scene → code for box + cylinder; render replaces sources (12 triangles); re-entering with the result selected loads it for update; template renders on an empty scene; a gear is exported as `meshes/gear.stl` and renders; syntax errors are reported and the line highlighted; Cmd+Enter renders; dirty drafts survive tab switches; *From selection* loads a stored script; cancel terminates and the next render works; after a page reload the shape still carries its script and loads for update; the viewport canvas shrinks to 860 px when the panel appears.
 
-### Known limitations / ideas for later
+### Known limitations / ideas for later (OpenSCAD mode)
 
 - `text()` in scripts has no fonts (the playground mounts a separate `fonts.zip`); SketchForge text shapes are exported as STL instead, which works. Standard libraries (BOSL2, MCAD…) are not bundled; `include`/`use` of them fails. Both could be added by writing more files into the worker FS.
 - No customizer UI; `$fn` and parameters are edited in code.
@@ -138,3 +138,77 @@ translate([x, -z, elevation + h/2]) [rotate([rx,0,0])] [rotate([0,0,ry])] [rotat
 - Low-`$fn` cylinders may differ from three.js by a 90° phase (first vertex on +X vs +Z); only `pyramid`/`polygon` compensate.
 - The render runs under `file://` (desktop static builds) is blocked by `openScadRuntimeAvailable()`; the Electron app uses the standalone HTTP server, so it is fine there.
 - Very large scenes regenerate STL files for every mesh-backed shape on each *From scene*; that is proportional to an STL export.
+
+## Box corner rounding styles and hollow boxes
+
+The Box shape gains two options aimed at 3D-printed enclosures: a choice of **which edges the corner radius rounds**, and a **hollow** mode with a wall and floor thickness (open top).
+
+### User-facing behaviour
+
+- Box inspector, *Properties* card: **Rounding** (`All edges` / `Vertical edges`) and **Corner Radius** (0 = sharp, capped at half the smallest dimension). `All edges` is upstream's rounded box (all 12 edges, `RoundedBoxGeometry`). `Vertical edges` rounds only the four vertical edges, i.e. a rounded rectangle extruded along the height, with flat top and bottom faces.
+- Box inspector, new *Hollow* card: **Wall** (0 = solid) and **Floor** (bottom thickness; defaults to the wall when unset). Any wall above 0 opens the top. With a corner radius, the cavity follows the outer rounding with radius `radius − wall`.
+- Everything else works as before: resizing, taper (applied after hollowing, so it deforms the shell), holes, grouping, booleans, STL/OBJ/STEP/SVG export (the exporter uses the same geometry builder), OpenSCAD code generation (emits `linear_extrude … offset()` for vertical rounding and `difference()` for hollow boxes), `.skf` and autosave persistence.
+
+### Data model
+
+`WorkplaneShape` (apps/web/src/types/sketchforge.ts) gains `boxCorners?: "all" | "vertical"`, `boxWall?: number`, `boxFloor?: number`. `radius` and `steps` keep their upstream meaning. Undefined values mean upstream behaviour, so existing projects are unchanged. `workplaneShapesEqual` compares the new fields; `sceneShape` in `shapeCatalog.ts` copies them (clipboard paste), and the `.skf` writer spreads the definition so nothing else was needed for persistence (covered by `tests/unit/openscadSkfRoundTrip.test.ts`).
+
+### Geometry (`apps/web/src/lib/boxGeometry.ts`)
+
+- `createBoxGeometry({ width, depth, height, radius, corners, wall, floor, steps })` returns a `THREE.BufferGeometry` centred on the origin.
+  - Solid: `BoxGeometry`, or `ExtrudeGeometry` of a rounded-rectangle `THREE.Shape` rotated so the extrusion runs along Y (`vertical`), or `RoundedBoxGeometry` (`all`).
+  - Hollow: an inner solid of the same style (`width − 2·wall`, `depth − 2·wall`, radius `max(0, radius − wall)`), raised by `floor` and extended 1 mm above the top, is subtracted with **three-bvh-csg** (`Evaluator`, `SUBTRACTION`, synchronous). The wall is clamped to `maxBoxWall(width, depth)` = `min(width, depth)/2 − 0.2` and the floor to `height − 0.2`, so impossible values degrade to a thin shell instead of failing. The CSG is synchronous so the viewport can build it inside its shared-geometry cache; it costs a few milliseconds for a rounded box.
+- `boxIsPlain(shape)` is the fast-path test (no radius, no wall). The viewport keeps drawing plain boxes from one shared unit cube scaled per shape; everything else is built at size and cached by its geometry signature, which now includes the three new fields.
+- Callers: `WorkplaneViewport.createShapeObject` (box case, geometry signature, resize fast path), `geometryMeshForShape` in `SketchForgeEditor.tsx` (export/booleans), `openscadCodegen.ts` (box case + `boxSolid` helper), `cadBakeMetadata.cadModifierPrimitiveForAnalyticBox` (returns null for non-plain boxes so fillet/chamfer uses the tessellated mesh).
+
+### Tests
+
+`tests/unit/boxGeometry.test.ts` ray-casts the generated geometry to check flat tops with vertical rounding, curved tops with full rounding, the cavity and floor of hollow boxes, and clamping. `tests/unit/openscadCodegen.test.ts` covers the generated OpenSCAD.
+
+### Known limitations
+
+- Hollow boxes are closed at the bottom only; there is no option for a lid or an open side. Use a hole shape for that.
+- The selection outline for rounded boxes is hidden (upstream behaviour); hollow sharp boxes show edges normally.
+- The fillet/chamfer modifier treats rounded or hollow boxes as meshes, not analytic boxes.
+
+## Latch & screw box generator shape
+
+Adds the "Latch & screw box generator" (the standalone page kept at `.codex/project-thumbnails/Latch & screw box generator.html`) as a shape inside the app: **Shapes → Latch Box** creates the enclosure **body** and its **cover** side by side, and the inspector exposes every generator parameter. Editing a parameter rebuilds both parts.
+
+### User-facing behaviour
+
+- *Shapes* menu, last entry **Latch Box**. It builds both parts in a worker (tens of milliseconds) and places them on the current workplane: body to the left, cover to the right, 6 mm apart, both in their print orientation (body open side up, cover flat on its outer face). Only the body is selected afterwards so the parameters show immediately.
+- Inspector for either part: cards **Box** (width, height, depth, wall, front plate, corner radius), **Latches** (count, width, lip protrusion, undercut, hook length, hook neck, hook style, support pad + gap/length/ramp), **Screw** (metric size, edge distance, boss width/length, hole depth, boss in cover, cover boss height, countersink + diameter) and **Cover & Fit** (cover thickness, side rails + width/height, clearance, curve segments). Checkboxes are rendered by the new toggle property. The generic Length/Width/Height and Taper controls are hidden for these shapes because the parameters define the size.
+- The generator's validation rules are shown as a red list above the cards; while any rule fails the parameters are stored but the geometry is not rebuilt (the notice shows the first error).
+- Body and cover created together share a set id, so editing one rebuilds both. Moving, rotating, colouring, deleting or ungrouping either part independently is fine. Copies keep the parameters and set id, so editing a copy also rebuilds its siblings.
+- The parts are ordinary mesh shapes for everything else: booleans, export, OpenSCAD code generation (they become `import("meshes/latch-box-body.stl")` etc.), `.skf` and autosave.
+
+### Architecture
+
+| File | Role |
+|---|---|
+| `apps/web/src/lib/latchBox.ts` | TypeScript port of the page's `BoxGen` core on **@jscad/modeling** (new dependency, MIT, ~1.6 MB, loaded only in the worker). Exports `LatchBoxParams`, `LATCH_BOX_DEFAULTS` (the measured Xiaomi AAA sensor case defaults, screw M3), `normalizeLatchBoxParams`, `validateLatchBoxParams`, `latchBoxBody`, `latchBoxCover`, `assembleLatchBoxCover`, `latchBoxTriangles` (the page's weld/T-junction `cleanMesh` + flat normals) and `buildLatchBox`. The geometry code is deliberately kept line-for-line equivalent to the page so output matches; the only change is that `screwHole`/`screwClearance` are derived from `screw` as the page's UI did. |
+| `apps/web/src/lib/latchBoxTypes.ts` | Worker protocol and `LatchBoxShapeData = { setId, part, params }`, stored on shapes as `WorkplaneShape.latchBox`. |
+| `apps/web/src/workers/latchBox.worker.ts` | Runs `buildLatchBox` off the main thread and transfers the triangle buffers. |
+| `apps/web/src/lib/latchBoxRuntime.ts` | `buildLatchBoxParts(params)`: singleton worker client with a 60 s timeout; falls back to running in-process when `Worker` is unavailable (tests). |
+| `apps/web/src/lib/latchBoxShapes.ts` | `latchBoxShapeFromMesh(part, mesh, { setId, params }, { existing?, placement? })`: converts the Z-up generator mesh with `zUpToSketchForge`, centres it X/Z with the base at y = 0, and returns a `kind: "mesh"` shape (`sourceFormat: "json"`, i.e. baked) carrying `latchBox`. With `existing` it keeps id, name, colour, placement, rotation, mirrors and lock state. `isLatchBoxShape` is the type guard. |
+| `apps/web/src/lib/latchBoxInspector.ts` | `latchBoxPropertyGroups(params, onChange)` builds the four inspector cards as `ShapePropertyConfig[]` (ranges with explicit `unit`, selects, toggles). |
+| `apps/web/src/lib/shapeCatalog.ts` | `LATCH_BOX_ASSET_ID = "latch-box"` and the toolbar entry (`kind: "mesh"`, reuses the box icon). |
+| `apps/web/src/components/SketchForgeEditor.tsx` | `addShape` intercepts the asset id and calls `addLatchBox(point)`; `scheduleLatchBoxUpdate(setId, params)` stores the parameters on every member immediately (no history entry), validates, debounces 150 ms, rebuilds in the worker and commits the regenerated parts; `updateShape` routes any `latchBox` patch to it (same pattern as `scheduleRevolveShapeUpdate`). |
+| `apps/web/src/components/workplane/ShapeInspector.tsx` | New `TogglePropertyConfig` + `ToggleProperty`, `unit` override on range properties, exported property types and `ShapePropertyRows`, `LatchBoxCards` (collapsible cards + error list) shown instead of the Properties/Taper cards when `shape.latchBox` is set. |
+| `apps/web/src/app/globals.css` | `.toggle-property`, `.property-hint`, `.latch-box-errors`. |
+
+### Coordinates
+
+Generator: box centred on XY, z = 0 front (closed) face, z = D open rim, +Y top (latches), −Y bottom (screw); cover in print orientation with its outer face on z = 0. Scene: generator `(x, y, z)` → SketchForge `(x, z, −y)`, so the body's open rim faces +Y (up) and the latches sit on the −Z side. The assembled transform from the page (`assembleLatchBoxCover`) is ported but not used by the UI yet.
+
+### Tests
+
+`tests/unit/latchBox.test.ts` checks validation of the defaults and of bad inputs, normalisation, the extents of the generated body (43 × 55 × 19) and cover, error throwing and the Y-up shape conversion. `tests/unit/openscadSkfRoundTrip.test.ts` checks that `latchBox` survives `.skf`.
+
+### Known limitations / ideas for later
+
+- No "assembled" or "cut" preview like the page; the parts are always side by side. `assembleLatchBoxCover` exists for a future "assemble" action.
+- No 3MF export; use STL (per part) from the normal export panel.
+- Resizing a part with the generic handles scales the baked mesh; the next parameter edit regenerates it at the parametric size.
+- The shapes menu icon is the plain box icon.

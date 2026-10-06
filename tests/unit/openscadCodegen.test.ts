@@ -147,6 +147,15 @@ describe("generateOpenScadFromShapes", () => {
     expect(result.source).toContain("[-5, 3], [5, 3], [5, -3], [-5, -3]");
   });
 
+  it("emits vertical-edge rounding and hollow boxes", () => {
+    const rounded = generateOpenScadFromShapes([shape({ radius: 2, boxCorners: "vertical", width: 20, depth: 10, height: 6 })]);
+    expect(rounded.source).toContain("linear_extrude(height = 6, center = true) offset(r = 2) square([16, 6], center = true);");
+    const hollow = generateOpenScadFromShapes([shape({ width: 20, depth: 10, height: 6, boxWall: 2, boxFloor: 1 })]);
+    expect(hollow.source).toContain("difference() {");
+    expect(hollow.source).toContain("cube([20, 10, 6], center = true);");
+    expect(hollow.source).toContain("translate([0, 0, 1]) cube([16, 6, 6], center = true);");
+  });
+
   it("describes an empty scene", () => {
     const result = generateOpenScadFromShapes([]);
     expect(result.source).toContain("// The scene is empty.");

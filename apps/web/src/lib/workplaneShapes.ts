@@ -299,6 +299,10 @@ export function workplaneShapesEqual(a: WorkplaneShape, b: WorkplaneShape) {
     a.groupedBaseHeight === b.groupedBaseHeight &&
     a.groupOperation === b.groupOperation &&
     a.openscadSource === b.openscadSource &&
+    a.boxCorners === b.boxCorners &&
+    a.boxWall === b.boxWall &&
+    a.boxFloor === b.boxFloor &&
+    a.latchBox === b.latchBox &&
     a.locked === b.locked &&
     a.hidden === b.hidden
   );

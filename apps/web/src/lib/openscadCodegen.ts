@@ -1,3 +1,4 @@
+import { boxCornerStyle, maxBoxFloor, maxBoxWall, MIN_BOX_WALL, type BoxCornerStyle } from "@/lib/boxGeometry";
 import type { MeshPoint } from "@/lib/meshCoordinates";
 import type { OpenScadInputFile } from "@/lib/openscadTypes";
 import { cadSketchRegions } from "@/lib/sketchCadProfile";
@@ -83,6 +84,19 @@ function nearly(a: number, b: number) {
 
 function slugify(name: string) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "shape";
+}
+
+/** Centred solid box with the fork's corner styles (see boxGeometry.ts). */
+function boxSolid(w: number, d: number, h: number, radius: number, corners: BoxCornerStyle): Stmt {
+  const r = Math.min(radius, w / 2, d / 2, corners === "all" ? h / 2 : Number.POSITIVE_INFINITY);
+  if (!(r > 0)) return [`cube(${vec([w, d, h])}, center = true);`];
+  if (corners === "vertical") {
+    return [`linear_extrude(height = ${num(h)}, center = true) offset(r = ${num(r)}) square(${vec([w - 2 * r, d - 2 * r])}, center = true);`];
+  }
+  return [
+    "hull() for (sx = [-1, 1], sy = [-1, 1], sz = [-1, 1])",
+    `${INDENT}translate([sx * ${num(w / 2 - r)}, sy * ${num(d / 2 - r)}, sz * ${num(h / 2 - r)}]) sphere(r = ${num(r)});`,
+  ];
 }
 
 function sidesFn(shape: WorkplaneShape, fallback?: number) {
@@ -214,14 +228,16 @@ class Emitter {
 
     switch (shape.kind) {
       case "box": {
-        if (shape.radius && shape.radius > 0) {
-          const r = Math.min(shape.radius, w / 2, d / 2, h / 2);
-          return [
-            "hull() for (sx = [-1, 1], sy = [-1, 1], sz = [-1, 1])",
-            `${INDENT}translate([sx * ${num(w / 2 - r)}, sy * ${num(d / 2 - r)}, sz * ${num(h / 2 - r)}]) sphere(r = ${num(r)});`,
-          ];
+        const radius = Math.max(0, shape.radius ?? 0);
+        const corners = boxCornerStyle(shape);
+        const outer = boxSolid(w, d, h, radius, corners);
+        const wall = Math.min(Math.max(0, shape.boxWall ?? 0), maxBoxWall(w, d));
+        if (wall >= MIN_BOX_WALL) {
+          const floor = Math.min(Math.max(0, shape.boxFloor ?? wall), maxBoxFloor(h));
+          const inner = boxSolid(w - 2 * wall, d - 2 * wall, h, Math.max(0, radius - wall), corners);
+          return block("difference()", [outer, prefix(`translate([0, 0, ${num(floor)}])`, inner)]);
         }
-        return [`cube(${vec([w, d, h])}, center = true);`];
+        return outer;
       }
       case "cylinder": {
         const body: Stmt = [`cylinder(h = ${num(h)}, d = ${num(w)}, center = true${sidesFn(shape)});`];

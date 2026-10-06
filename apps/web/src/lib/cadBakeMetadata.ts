@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import type { WorkplaneShape } from "@/types/sketchforge";
 import type { CadModifierPrimitivePart } from "@/lib/cadModifierTypes";
+import { boxIsPlain } from "@/lib/boxGeometry";
 import { mirrorSign, resizedImportedCoordinates, shapeDepth, shapeWidth } from "@/lib/workplaneShapes";
 
 export type BakedCadMetadataFrame = {
@@ -45,7 +46,8 @@ function allFinitePositive(values: number[]) {
 }
 
 export function cadModifierPrimitiveForAnalyticBox(shape: WorkplaneShape): CadModifierPrimitivePart | null {
-  if (shape.kind !== "box" || shape.importedMesh || shape.groupedShapes?.length) {
+  // Rounded or hollow boxes (fork feature) are not analytic cuboids.
+  if (shape.kind !== "box" || shape.importedMesh || shape.groupedShapes?.length || !boxIsPlain(shape)) {
     return null;
   }
 
