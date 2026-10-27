@@ -1,3 +1,4 @@
+import { importedShapeFrom3mf } from "@/lib/threeMfImport";
 import { strFromU8, strToU8, unzip, zip, type AsyncZippable } from "fflate";
 import { editorHistoryEntry, hydrateEditorHistoryState, type EditorHistoryEntry } from "@/lib/editorHistory";
 import { normalizePlacementWorkplane, placementWorkplaneIsBase, type PlacementWorkplane } from "@/lib/placementWorkplane";
@@ -1070,7 +1071,7 @@ async function validateDocumentAndAssets(raw: unknown, files: ArchiveFiles) {
     if (bytes.byteLength !== asset.byteLength) throw new Error(`Asset '${asset.path}' has an invalid size`);
     const hash = await sha256Hex(bytes);
     if (hash !== asset.sha256) throw new Error(`Asset '${asset.path}' failed its integrity check`);
-    if (asset.kind === "source" && !["stl", "obj", "svg", "step"].includes(asset.sourceFormat ?? "")) {
+    if (asset.kind === "source" && !["stl", "obj", "svg", "step", "3mf"].includes(asset.sourceFormat ?? "")) {
       throw new Error(`Source asset '${id}' has an unknown source format`);
     }
     assetById.set(id, asset);
@@ -1154,6 +1155,7 @@ async function defaultSourceImporter(asset: ProjectAsset) {
   if (asset.sourceFormat === "stl") return importedShapeFromStl(asset.name, exactArrayBuffer(asset.bytes)).importedMesh as NonNullable<WorkplaneShape["importedMesh"]>;
   if (asset.sourceFormat === "obj") return importedShapeFromObj(asset.name, strFromU8(asset.bytes)).importedMesh as NonNullable<WorkplaneShape["importedMesh"]>;
   if (asset.sourceFormat === "svg") return importedShapeFromSvg(asset.name, strFromU8(asset.bytes)).importedMesh as NonNullable<WorkplaneShape["importedMesh"]>;
+  if (asset.sourceFormat === "3mf") return importedShapeFrom3mf(asset.name, asset.bytes).importedMesh as NonNullable<WorkplaneShape["importedMesh"]>;
   if (asset.sourceFormat === "step") {
     const { importedShapeFromStep } = await import("@/lib/stepImport");
     return (await importedShapeFromStep(asset.name, exactArrayBuffer(asset.bytes))).importedMesh as NonNullable<WorkplaneShape["importedMesh"]>;

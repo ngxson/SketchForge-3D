@@ -90,6 +90,25 @@ describe("STEP export round-trip (real OCCT kernel)", () => {
     expect(near(await reimportVolume(blob), expected)).toBe(true);
   });
 
+  it("exports hollow cylinders (cup and open tube) with conserved volume", async () => {
+    const cup = shape({ kind: "cylinder", name: "Cup", x: -30, width: 20, depth: 20, height: 10, cylinderWall: 2, cylinderFloor: 3 });
+    const tube = shape({ kind: "cylinder", name: "Tube", x: 30, width: 20, depth: 20, height: 10, cylinderWall: 2, cylinderFloor: 0 });
+    const { blob, exportedCount, skipped } = await exportShapesToStep([cup, tube]);
+    expect(exportedCount).toBe(2);
+    expect(skipped).toEqual([]);
+    const cupVolume = PI * 100 * 10 - PI * 64 * 7;
+    const tubeVolume = PI * 100 * 10 - PI * 64 * 10;
+    expect(near(await reimportVolume(blob), cupVolume + tubeVolume)).toBe(true);
+  });
+
+  it("skips rounded or hollow boxes instead of exporting a plain box", async () => {
+    const plain = shape({ kind: "box", name: "Plain", x: -20 });
+    const rounded = shape({ kind: "box", name: "Rounded", x: 20, radius: 2 });
+    const { exportedCount, skipped } = await exportShapesToStep([plain, rounded]);
+    expect(exportedCount).toBe(1);
+    expect(skipped.map((entry) => entry.name)).toEqual(["Rounded"]);
+  });
+
   it("leaves a body untouched when the hole's AABB does not reach it", async () => {
     const body = shape({ kind: "box", name: "Plate", x: 0, width: 10, depth: 10, height: 10 });
     const farHole = shape({ kind: "cylinder", name: "Bore", hole: true, x: 500, width: 4, depth: 4, height: 20 });

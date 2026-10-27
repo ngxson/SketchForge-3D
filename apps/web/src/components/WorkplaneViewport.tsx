@@ -7,6 +7,8 @@ import { Brush, Evaluator, HOLLOW_INTERSECTION } from "three-bvh-csg";
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { boxGeometryOptionsFromShape, boxIsPlain, createBoxGeometry } from "@/lib/boxGeometry";
+import { buildHollowCylinderGeometry, cylinderIsPlain, hollowCylinderOptionsFromShape } from "@/lib/cylinderGeometry";
+import { isReferenceImage, referenceImageOpacity } from "@/lib/referenceImage";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
@@ -38,12 +40,13 @@ import {
   placementWorkplanePoint,
   placementWorkplaneQuaternion,
   snapPlacementWorkplaneOrigin,
+  axisLockedDragDelta,
   type PlacementPoint,
   type PlacementWorkplane,
 } from "@/lib/placementWorkplane";
 import { regularPolygonFootprintScale } from "@/lib/regularPolygonFootprint";
 import { projectThumbnailDimensions } from "@/lib/projectThumbnail";
-import { canBeginShapeDrag, DEFAULT_SNAP_GRID, DEFAULT_WORKPLANE_WORKSPACE, normalizeSnapGrid, normalizeWorkspaceSettings, shapeDimensionLimit, workplaneSettingsFingerprint, workspaceHydrationSyncDecision } from "@/lib/workplaneSettings";
+import { canBeginShapeDrag, DEFAULT_SNAP_GRID, DEFAULT_WORKPLANE_WORKSPACE, normalizeSnapGrid, normalizeWorkspaceSettings, shapeDimensionLimit, workplaneSettingsFingerprint, workspaceHydrationPendingFingerprint, workspaceHydrationSyncDecision } from "@/lib/workplaneSettings";
 import { interiorWorkplaneGridCoordinates, workplaneThemePalette, WORKPLANE_LINE_ELEVATION, WORKPLANE_MAJOR_GRID_INTERVAL } from "@/lib/workplaneGrid";
 import { cleanNearZero, cleanRotationDegrees, fallbackSolidColor, mirroredAxisCount, mirrorSign, preservesEdgeTreatmentSize, proportionalResizeScale, resizedImportedCoordinates, resizedImportedMeshPositions, resizedShapeSize, shapeDepth, shapeHasTaper, shapeOverallFootprintDimensions, shapeTaperDimensions, shapeTaperScaleAt, shapeWidth } from "@/lib/workplaneShapes";
 import { sphereTessellation } from "@/lib/sphereTessellation";
@@ -90,6 +93,12 @@ const MIN_SHAPE_SIZE = 0.01;
 const CUT_PREVIEW_PADDING = 0.01;
 const MIN_ELEVATION = -180;
 const MAX_ELEVATION = 220;
+// Fork change (see FORK.md): the orthographic camera keeps geometry on both sides of its
+// position (negative near plane). Its distance to the orbit centre is fixed, so after panning
+// far, parts of the model can sit "behind" the camera and were cut off by a 0.1 mm near plane.
+const PERSPECTIVE_NEAR = 0.1;
+const CAMERA_FAR = 6000;
+const ORTHOGRAPHIC_NEAR = -CAMERA_FAR;
 const CAMERA_MIN_TARGET_Y = -70;
 const CAMERA_MAX_TARGET_Y = 120;
 const ROTATION_PROTRACTOR_OUTER_RADIUS = 94;
@@ -145,6 +154,100 @@ const shapeResourceIds = new WeakMap<object, number>();
 let nextShapeResourceId = 1;
 const imageTextureLoader = new THREE.TextureLoader();
 const IMPORTED_SELECTED_EDGE_TRIANGLE_LIMIT = 40000;
+/** Shape outlines (fork change, see FORK.md): crease angle in degrees, darkening of the shape colour, opacity. */
+const SHAPE_OUTLINE_ANGLE = 30;
+const SHAPE_OUTLINE_DARKEN = 0.5;
+const SHAPE_OUTLINE_OPACITY = 0.9;
+/** Outline width in CSS pixels; WebGL draws plain lines 1 px wide, so outlines use fat lines. */
+const SHAPE_OUTLINE_WIDTH = 2.5;
+const shapeOutlineMaterialCache = new Map<string, LineMaterial>();
+const shapeOutlineGeometryCache = new WeakMap<THREE.BufferGeometry, LineSegmentsGeometry>();
+const shapeOutlineResolution = new THREE.Vector2(1, 1);
+
+function sharedShapeOutlineMaterial(color: string, opacity: number) {
+  const key = `${color}|${opacity}`;
+  const cached = shapeOutlineMaterialCache.get(key);
+  if (cached) return cached;
+  const material = new LineMaterial({ color, linewidth: SHAPE_OUTLINE_WIDTH, worldUnits: false, transparent: opacity < 1, opacity });
+  material.resolution.copy(shapeOutlineResolution);
+  material.userData.cached = true;
+  shapeOutlineMaterialCache.set(key, material);
+  return material;
+}
+
+function setShapeOutlineResolution(width: number, height: number) {
+  shapeOutlineResolution.set(width, height);
+  shapeOutlineMaterialCache.forEach((material) => material.resolution.set(width, height));
+}
+
+// Fork change (see FORK.md, "Faster moves in busy scenes"): the move-dimension and transform-guide
+// overlays are rebuilt on every pointer move. Their materials are shared here so the rebuild does not
+// dispose a material (which releases its shader program) and compile a fresh one each move.
+const overlayLineMaterialCache = new Map<string, LineMaterial>();
+const overlayFillMaterialCache = new Map<string, THREE.MeshBasicMaterial>();
+
+type OverlayLineMaterialOptions = {
+  color: string;
+  linewidth: number;
+  opacity: number;
+  dashed?: boolean;
+  dashSize?: number;
+  gapSize?: number;
+};
+
+function sharedOverlayLineMaterial(state: ThreeState, options: OverlayLineMaterialOptions) {
+  const key = JSON.stringify(options);
+  let material = overlayLineMaterialCache.get(key);
+  if (!material) {
+    material = new LineMaterial({
+      color: options.color,
+      linewidth: options.linewidth,
+      worldUnits: false,
+      dashed: Boolean(options.dashed),
+      dashSize: options.dashSize ?? 1,
+      gapSize: options.gapSize ?? 1,
+      transparent: true,
+      opacity: options.opacity,
+      depthTest: false,
+      depthWrite: false,
+      alphaToCoverage: false,
+    });
+    material.toneMapped = false;
+    material.userData.cached = true;
+    overlayLineMaterialCache.set(key, material);
+  }
+  const rect = state.renderer.domElement.getBoundingClientRect();
+  material.resolution.set(Math.max(1, rect.width), Math.max(1, rect.height));
+  return material;
+}
+
+function sharedOverlayFillMaterial(color: string) {
+  let material = overlayFillMaterialCache.get(color);
+  if (!material) {
+    material = new THREE.MeshBasicMaterial({
+      color,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 1,
+      depthTest: false,
+      depthWrite: false,
+    });
+    material.toneMapped = false;
+    material.userData.cached = true;
+    overlayFillMaterialCache.set(color, material);
+  }
+  return material;
+}
+
+function shapeOutlineGeometry(edges: THREE.BufferGeometry) {
+  let geometry = shapeOutlineGeometryCache.get(edges);
+  if (!geometry) {
+    geometry = new LineSegmentsGeometry().fromEdgesGeometry(edges as THREE.EdgesGeometry);
+    geometry.userData.cached = true;
+    shapeOutlineGeometryCache.set(edges, geometry);
+  }
+  return geometry;
+}
 const NORMAL_IMPORTED_SELECTION_EDGE_ANGLE = 60;
 const MODIFIER_EDGE_PICK_RADIUS_PX = 14;
 
@@ -209,6 +312,10 @@ type WorkplaneViewportProps = {
   onEditSketch?: () => void;
   canSeparateParts?: boolean;
   onSeparateParts?: () => void;
+  /** Fork (see FORK.md): grow (positive) or shrink the selected shapes' surfaces by a distance in mm. */
+  onOffsetSelection?: (distance: number) => void;
+  /** Fork (see FORK.md): add a solid filling the selected shape's hollow part, shrunk by a clearance. */
+  onFillHollow?: (clearance: number) => void;
   onUpdateShape: (id: string, patch: ShapeUpdatePatch) => void;
   onWorkspaceSettingsChange?: (settings: { workspace: WorkplaneWorkspaceSettings; snap: GridSize }) => void;
   onWorkplaneModeChange: (active: boolean) => void;
@@ -222,6 +329,8 @@ type WorkplaneViewportProps = {
   themePreference?: AppThemePreference;
   resolvedTheme?: ResolvedAppTheme;
   onThemePreferenceChange?: (preference: AppThemePreference) => void;
+  /** Filled with a getter for the live camera (it changes on projection toggle), e.g. for view-relative arrow keys. */
+  cameraAccessRef?: MutableRefObject<(() => THREE.Camera | null) | null>;
 };
 
 type WorkspaceSettings = WorkplaneWorkspaceSettings;
@@ -286,6 +395,7 @@ type ThreeState = {
   moveDimensionLayer: THREE.Group;
   modifierLayer: THREE.Group;
   shapeRecords: Map<string, ShapeRenderRecord>;
+  cutPreviewPairs: Map<string, CutPreviewPairEntry>;
   officialShapeLayerActive: boolean;
   raycaster: THREE.Raycaster;
   pointer: THREE.Vector2;
@@ -333,6 +443,8 @@ type DragState = {
   primaryStartX: number;
   primaryStartZ: number;
   items: DragItem[];
+  /** Last pointer position, so a Shift press can re-apply the axis lock without a move. */
+  lastClient?: { x: number; y: number };
 };
 
 type MoveDimensionSession = {
@@ -759,19 +871,7 @@ function syncMoveDimensionWorldLines(
     }
     const geometry = new LineSegmentsGeometry();
     geometry.setPositions(points);
-    const material = new LineMaterial({
-      color,
-      linewidth,
-      worldUnits: false,
-      transparent: true,
-      opacity,
-      depthTest: false,
-      depthWrite: false,
-      alphaToCoverage: false,
-    });
-    material.toneMapped = false;
-    const rect = state.renderer.domElement.getBoundingClientRect();
-    material.resolution.set(Math.max(1, rect.width), Math.max(1, rect.height));
+    const material = sharedOverlayLineMaterial(state, { color, linewidth, opacity });
     const lines = new LineSegments2(geometry, material);
     lines.renderOrder = renderOrder;
     lines.frustumCulled = false;
@@ -793,16 +893,7 @@ function syncMoveDimensionWorldLines(
         base.x - perpendicular.x, base.y, base.z - perpendicular.z,
       ], 3),
     );
-    const arrowMaterial = new THREE.MeshBasicMaterial({
-      color: solidColor,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 1,
-      depthTest: false,
-      depthWrite: false,
-    });
-    arrowMaterial.toneMapped = false;
-    const arrow = new THREE.Mesh(geometry, arrowMaterial);
+    const arrow = new THREE.Mesh(geometry, sharedOverlayFillMaterial(solidColor));
     arrow.renderOrder = 1002;
     arrow.frustumCulled = false;
     setObjectRenderLayer(arrow, RENDER_LAYER_HELPERS);
@@ -855,22 +946,14 @@ function syncTransformGuideWorldLines(
   const positions = segments.flatMap(([start, end]) => [start.x, start.y, start.z, end.x, end.y, end.z]);
   const geometry = new LineSegmentsGeometry();
   geometry.setPositions(positions);
-  const material = new LineMaterial({
+  const material = sharedOverlayLineMaterial(state, {
     color: theme === "dark" ? "#cfe1ea" : "#1f272e",
     linewidth: 1.15,
-    worldUnits: false,
+    opacity: theme === "dark" ? 0.86 : 0.72,
     dashed: true,
     dashSize: 0.625,
     gapSize: 0.625,
-    transparent: true,
-    opacity: theme === "dark" ? 0.86 : 0.72,
-    depthTest: false,
-    depthWrite: false,
-    alphaToCoverage: false,
   });
-  material.toneMapped = false;
-  const rect = state.renderer.domElement.getBoundingClientRect();
-  material.resolution.set(Math.max(1, rect.width), Math.max(1, rect.height));
   const lines = new LineSegments2(geometry, material);
   lines.computeLineDistances();
   lines.renderOrder = 999;
@@ -1002,7 +1085,8 @@ function shapeGeometrySignature(shape: WorkplaneShape): string {
   if (boxIsPlain(shape)) {
     return JSON.stringify({ kind: "box", taper });
   }
-  if (shape.kind === "cylinder") {
+  // Hollow cylinders (fork feature) are built at size and fall through to the full signature.
+  if (cylinderIsPlain(shape)) {
     return JSON.stringify({ kind: "cylinder", sides: shape.sides, segments: shape.segments, taper });
   }
   if (shape.kind === "sphere") {
@@ -1018,6 +1102,8 @@ function shapeGeometrySignature(shape: WorkplaneShape): string {
     boxCorners: shape.boxCorners,
     boxWall: shape.boxWall,
     boxFloor: shape.boxFloor,
+    cylinderWall: shape.cylinderWall,
+    cylinderFloor: shape.cylinderFloor,
     width: shapeWidth(shape),
     depth: shapeDepth(shape),
     height: shape.height,
@@ -2381,6 +2467,8 @@ export function WorkplaneViewport({
   onEditSketch,
   canSeparateParts = false,
   onSeparateParts,
+  onOffsetSelection,
+  onFillHollow,
   onUpdateShape,
   onWorkspaceSettingsChange,
   onWorkplaneModeChange,
@@ -2394,6 +2482,7 @@ export function WorkplaneViewport({
   themePreference = "system",
   resolvedTheme = "light",
   onThemePreferenceChange,
+  cameraAccessRef,
 }: WorkplaneViewportProps) {
   const [snapOpen, setSnapOpen] = useState(false);
   const [snap, setSnap] = useState<GridSize>(() => normalizeSnapGrid(initialSnap, DEFAULT_SNAP_GRID));
@@ -2612,7 +2701,12 @@ export function WorkplaneViewport({
     // new object references even when the values are unchanged, which previously
     // caused this effect and its callback effect to update each other indefinitely.
     lastWorkspaceSettingsSyncRef.current = nextFingerprint;
-    pendingWorkspaceHydrationFingerprintRef.current = nextFingerprint;
+    // Fork fix (see FORK.md): when the parent echoes back a change made here, nothing will
+    // follow through state, so don't wait for it (that swallowed every later snap change).
+    pendingWorkspaceHydrationFingerprintRef.current = workspaceHydrationPendingFingerprint(
+      workplaneSettingsFingerprint(workspaceRef.current, snapRef.current),
+      nextFingerprint,
+    );
     snapRef.current = nextSnap;
     workspaceRef.current = nextWorkspace;
     if (threeRef.current) {
@@ -2906,6 +3000,14 @@ export function WorkplaneViewport({
   }, [activeTransformKind, workplaneMode]);
 
   useEffect(() => {
+    if (!cameraAccessRef) return;
+    cameraAccessRef.current = () => threeRef.current?.camera ?? null;
+    return () => {
+      cameraAccessRef.current = null;
+    };
+  }, [cameraAccessRef]);
+
+  useEffect(() => {
     const host = hostRef.current;
     if (!host) {
       return;
@@ -3112,7 +3214,9 @@ export function WorkplaneViewport({
   }, [toRawPlanePoint]);
   const toPlanePoint = useCallback((clientX: number, clientY: number) => toPlanePointAtY(clientX, clientY, 0), [toPlanePointAtY]);
 
-  const toPlacementWorkplanePoint = useCallback((clientX: number, clientY: number, workplane = placementWorkplaneRef.current) => {
+  // `clampToArea` keeps the point inside the workplane grid (upstream behaviour). Moving
+  // existing shapes passes false so they can be dragged past the grid (fork change, see FORK.md).
+  const toPlacementWorkplanePoint = useCallback((clientX: number, clientY: number, workplane = placementWorkplaneRef.current, clampToArea = true) => {
     const normal = new THREE.Vector3(workplane.normal.x, workplane.normal.y, workplane.normal.z);
     const origin = new THREE.Vector3(workplane.origin.x, workplane.origin.y, workplane.origin.z);
     const raw = toRawPlanePoint(clientX, clientY, new THREE.Plane(normal, -normal.dot(origin)));
@@ -3120,10 +3224,11 @@ export function WorkplaneViewport({
     const local = placementWorkplaneCoordinates(workplane, raw);
     const step = snapStep(snapRef.current);
     const bounds = workspaceRef.current;
+    const limit = (value: number, size: number) => (clampToArea ? clamp(value, -size / 2 + 6, size / 2 - 6) : value);
     return placementWorkplanePoint(
       workplane,
-      clamp(snapValue(local.x, step), -bounds.width / 2 + 6, bounds.width / 2 - 6),
-      clamp(snapValue(local.z, step), -bounds.depth / 2 + 6, bounds.depth / 2 - 6),
+      limit(snapValue(local.x, step), bounds.width),
+      limit(snapValue(local.z, step), bounds.depth),
     );
   }, [toRawPlanePoint]);
 
@@ -3571,7 +3676,7 @@ export function WorkplaneViewport({
       }
       if (state) {
         if (kind !== "scale" && kind !== "height") {
-          clearCutPreviewOverlays(state);
+          detachCutPreviewOverlays(state);
         }
         state.needsRender = true;
         state.controls.enabled = false;
@@ -3818,8 +3923,8 @@ export function WorkplaneViewport({
         const patch: Partial<WorkplaneShape> = rotationPatchFromQuaternion(nextQuaternion);
         if (transform.items.length > 1) {
           const nextCenter = pivot.clone().add(item.startCenter.clone().sub(pivot).applyQuaternion(rotationDelta));
-          patch.x = snapPositionValue(nextCenter.x, step, -workspaceRef.current.width / 2 + 6, workspaceRef.current.width / 2 - 6);
-          patch.z = snapPositionValue(nextCenter.z, step, -workspaceRef.current.depth / 2 + 6, workspaceRef.current.depth / 2 - 6);
+          patch.x = snapPositionValue(nextCenter.x, step, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
+          patch.z = snapPositionValue(nextCenter.z, step, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
           patch.elevation = snapPositionValue(nextCenter.y - item.startShape.height / 2, step, MIN_ELEVATION, MAX_ELEVATION);
         }
         onUpdateShape(item.id, patch);
@@ -4053,7 +4158,8 @@ export function WorkplaneViewport({
       const shapeId = entry.object.userData.shapeId;
       if (typeof shapeId !== "string") return false;
       const shape = shapesRef.current.find((candidate) => candidate.id === shapeId);
-      return shape ? !shape.imagePlate : false;
+      // Image plates are not clickable upstream; reference images (fork) are selected by clicking the photo.
+      return shape ? !shape.imagePlate || isReferenceImage(shape) : false;
     });
     if (hit) {
       return hit.object.userData.shapeId as string;
@@ -4359,7 +4465,7 @@ export function WorkplaneViewport({
           setRotationReadout(null);
         }
         if (handle.kind !== "scale" && handle.kind !== "height") {
-          clearCutPreviewOverlays(state);
+          detachCutPreviewOverlays(state);
         }
         state.needsRender = true;
         state.controls.enabled = false;
@@ -4398,7 +4504,7 @@ export function WorkplaneViewport({
       }
       const dragPlaneY = shape ? shape.elevation ?? 0 : 0;
       const activeWorkplane = placementWorkplaneRef.current;
-      const point = toPlacementWorkplanePoint(event.clientX, event.clientY, activeWorkplane);
+      const point = toPlacementWorkplanePoint(event.clientX, event.clientY, activeWorkplane, false);
       if (!point || !shape) {
         return;
       }
@@ -4504,6 +4610,85 @@ export function WorkplaneViewport({
     ],
   );
 
+  const updateDrag = useCallback(
+    (clientX: number, clientY: number, shiftKey: boolean) => {
+      const drag = dragRef.current;
+      if (!drag) {
+        return;
+      }
+
+      drag.lastClient = { x: clientX, y: clientY };
+      const point = toPlacementWorkplanePoint(clientX, clientY, drag.workplane, false);
+      if (!point) {
+        return;
+      }
+
+      // Fork change (see FORK.md): with Shift held, the move is locked to the workplane X or
+      // Y grid line through the start point, whichever is closer to the drag direction.
+      const { x: deltaX, y: deltaY, z: deltaZ } = axisLockedDragDelta(
+        { x: point.x - drag.startPoint.x, y: point.y - drag.startPoint.y, z: point.z - drag.startPoint.z },
+        drag.workplane,
+        shiftKey,
+      );
+      const moveDimensionSession = moveDimensionSessionRef.current;
+      if (moveDimensionSession) {
+        moveDimensionSession.deltaX = deltaX;
+        moveDimensionSession.deltaZ = deltaZ;
+        moveDimensionSession.active = true;
+      }
+
+      drag.items.forEach((item) => {
+        item.nextX = item.startX + deltaX;
+        item.nextZ = item.startZ + deltaZ;
+        item.nextElevation = item.startElevation + deltaY;
+        if (threeRef.current) applyDragItemPreview(threeRef.current, item);
+      });
+      if (threeRef.current) {
+        const previewShapes = previewShapesForDrag(shapesRef.current, drag);
+        updateSelectedGroundFootprintPreviews(threeRef.current, drag);
+        syncTransformOverlay(
+          threeRef.current,
+          previewShapes,
+          renderSelectionIds(),
+          transformOverlayRef,
+          setTransformOverlay,
+          workspaceRef.current.accuracy,
+          true,
+          true,
+          placementWorkplaneRef.current,
+          resolvedThemeRef.current,
+        );
+        syncCutPreviewOverlays(threeRef.current, previewShapes);
+        syncMoveDimensionOverlay(
+          threeRef.current,
+          moveDimensionSession,
+          moveDimensionOverlayRef,
+          setMoveDimensionOverlay,
+          workspaceRef.current.accuracy,
+          resolvedThemeRef.current,
+        );
+        threeRef.current.lastOverlaySync = performance.now();
+        threeRef.current.needsRender = true;
+      }
+    },
+    [renderSelectionIds, toPlacementWorkplanePoint],
+  );
+
+  // Pressing or releasing Shift mid-drag re-applies the axis lock without waiting for the mouse.
+  useEffect(() => {
+    const onShift = (event: KeyboardEvent) => {
+      const drag = dragRef.current;
+      if (event.key !== "Shift" || !drag?.lastClient || event.repeat) return;
+      updateDrag(drag.lastClient.x, drag.lastClient.y, event.type === "keydown");
+    };
+    window.addEventListener("keydown", onShift);
+    window.addEventListener("keyup", onShift);
+    return () => {
+      window.removeEventListener("keydown", onShift);
+      window.removeEventListener("keyup", onShift);
+    };
+  }, [updateDrag]);
+
   const handlePointerMove = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (workplaneModeRef.current) {
@@ -4567,61 +4752,11 @@ export function WorkplaneViewport({
         return;
       }
 
-      const drag = dragRef.current;
-      if (!drag) {
-        return;
-      }
-
-      const point = toPlacementWorkplanePoint(event.clientX, event.clientY, drag.workplane);
-      if (!point) {
-        return;
-      }
-
-      const deltaX = point.x - drag.startPoint.x;
-      const deltaY = point.y - drag.startPoint.y;
-      const deltaZ = point.z - drag.startPoint.z;
-      const moveDimensionSession = moveDimensionSessionRef.current;
-      if (moveDimensionSession) {
-        moveDimensionSession.deltaX = deltaX;
-        moveDimensionSession.deltaZ = deltaZ;
-        moveDimensionSession.active = true;
-      }
-
-      drag.items.forEach((item) => {
-        item.nextX = item.startX + deltaX;
-        item.nextZ = item.startZ + deltaZ;
-        item.nextElevation = item.startElevation + deltaY;
-        if (threeRef.current) applyDragItemPreview(threeRef.current, item);
-      });
-      if (threeRef.current) {
-        const previewShapes = previewShapesForDrag(shapesRef.current, drag);
-        updateSelectedGroundFootprintPreviews(threeRef.current, drag);
-        syncTransformOverlay(
-          threeRef.current,
-          previewShapes,
-          renderSelectionIds(),
-          transformOverlayRef,
-          setTransformOverlay,
-          workspaceRef.current.accuracy,
-          true,
-          true,
-          placementWorkplaneRef.current,
-          resolvedThemeRef.current,
-        );
-        syncCutPreviewOverlays(threeRef.current, previewShapes);
-        syncMoveDimensionOverlay(
-          threeRef.current,
-          moveDimensionSession,
-          moveDimensionOverlayRef,
-          setMoveDimensionOverlay,
-          workspaceRef.current.accuracy,
-          resolvedThemeRef.current,
-        );
-        threeRef.current.lastOverlaySync = performance.now();
-        threeRef.current.needsRender = true;
+      if (dragRef.current) {
+        updateDrag(event.clientX, event.clientY, event.shiftKey);
       }
     },
-    [pickPlacementSurface, setMarqueeFromState, toPlacementWorkplanePoint, toRawPlanePoint, updateModifierEdgeHover, updateRulerHover, updateTransform],
+    [pickPlacementSurface, setMarqueeFromState, toRawPlanePoint, updateDrag, updateModifierEdgeHover, updateRulerHover, updateTransform],
   );
 
   const handlePointerLeave = useCallback(() => {
@@ -5205,6 +5340,8 @@ export function WorkplaneViewport({
           onEditSketch={selectedShape.sketchProfile ? onEditSketch : undefined}
           canSeparateParts={canSeparateParts}
           onSeparateParts={onSeparateParts}
+          onOffset={onOffsetSelection}
+          onFillHollow={onFillHollow}
           onInteractionActiveChange={onInteractionActiveChange}
         />
       ) : null}
@@ -5253,6 +5390,7 @@ function createThreeScene(host: HTMLDivElement): ThreeState {
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance", preserveDrawingBuffer: false });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(host.clientWidth, host.clientHeight);
+  setShapeOutlineResolution(Math.max(1, host.clientWidth), Math.max(1, host.clientHeight));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.shadowMap.enabled = DEFAULT_WORKSPACE.showShadows;
   renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -5261,7 +5399,7 @@ function createThreeScene(host: HTMLDivElement): ThreeState {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color("#f8fbfc");
 
-  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, host.clientWidth / Math.max(1, host.clientHeight), 0.1, 6000);
+  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, host.clientWidth / Math.max(1, host.clientHeight), PERSPECTIVE_NEAR, CAMERA_FAR);
   camera.layers.enable(RENDER_LAYER_SHAPES);
   camera.layers.enable(RENDER_LAYER_HELPERS);
   camera.layers.enable(RENDER_LAYER_MODIFIERS);
@@ -5343,6 +5481,7 @@ function createThreeScene(host: HTMLDivElement): ThreeState {
     const height = Math.max(1, host.clientHeight);
     renderer.setSize(width, height);
     updateCameraViewport(state.camera, width, height);
+    setShapeOutlineResolution(width, height);
     [state.transformGuideLayer, state.moveDimensionLayer].forEach((layer) => {
       layer.traverse((child) => {
         const material = (child as THREE.Mesh).material;
@@ -5370,6 +5509,7 @@ function createThreeScene(host: HTMLDivElement): ThreeState {
     moveDimensionLayer,
     modifierLayer,
     shapeRecords: new Map<string, ShapeRenderRecord>(),
+    cutPreviewPairs: new Map<string, CutPreviewPairEntry>(),
     officialShapeLayerActive: false,
     raycaster,
     pointer,
@@ -5482,8 +5622,8 @@ function toggleCameraProjection(state: ThreeState) {
       visibleHalfHeight * aspect,
       visibleHalfHeight,
       -visibleHalfHeight,
-      current.near,
-      current.far,
+      ORTHOGRAPHIC_NEAR,
+      CAMERA_FAR,
     );
     next.position.copy(current.position);
   } else {
@@ -5493,7 +5633,7 @@ function toggleCameraProjection(state: ThreeState) {
       22,
       4200,
     );
-    next = new THREE.PerspectiveCamera(CAMERA_FOV, aspect, current.near, current.far);
+    next = new THREE.PerspectiveCamera(CAMERA_FOV, aspect, PERSPECTIVE_NEAR, CAMERA_FAR);
     next.position.copy(target).addScaledVector(direction, distance);
   }
 
@@ -5532,9 +5672,12 @@ function setCameraToViewFace(state: ThreeState, face: ViewCubeFace) {
 function constrainCamera(state: ThreeState, workspace: WorkspaceSettings) {
   const target = state.controls.target;
   const previousTarget = target.clone();
-  target.x = clamp(target.x, -workspace.width / 2, workspace.width / 2);
-  target.y = clamp(target.y, CAMERA_MIN_TARGET_Y, CAMERA_MAX_TARGET_Y);
-  target.z = clamp(target.z, -workspace.depth / 2, workspace.depth / 2);
+  // Fork change (see FORK.md): panning may go two workplane sizes past the grid in every
+  // direction (upstream stops at the grid edge), so objects dragged off the grid stay reachable.
+  const margin = 2 * Math.max(workspace.width, workspace.depth);
+  target.x = clamp(target.x, -workspace.width / 2 - margin, workspace.width / 2 + margin);
+  target.y = clamp(target.y, CAMERA_MIN_TARGET_Y - margin, CAMERA_MAX_TARGET_Y + margin);
+  target.z = clamp(target.z, -workspace.depth / 2 - margin, workspace.depth / 2 + margin);
 
   const targetShift = target.clone().sub(previousTarget);
   if (targetShift.lengthSq() > 0) {
@@ -5803,6 +5946,25 @@ type CutPreviewShapeFrame = {
   worldBounds: THREE.Box3;
 };
 
+// Fork change (see FORK.md, "Faster moves in busy scenes"): one hole/solid pair's cut preview is
+// cached by the pair's geometry and placement so only pairs touching a changed shape run CSG again.
+type CutPreviewPairEntry = {
+  key: string;
+  mesh: THREE.Mesh | null;
+};
+
+// Every overlay shares this material. Disposing a per-overlay material released its shader program,
+// so three.js recompiled and re-linked it on the next pointer move.
+const cutPreviewMaterial = new THREE.MeshBasicMaterial({
+  color: "#30363a",
+  transparent: true,
+  opacity: 0.34,
+  depthTest: false,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+});
+cutPreviewMaterial.userData.cached = true;
+
 function shapeCutPreviewFrames(state: ThreeState, shapes: WorkplaneShape[]) {
   return shapes.reduce<Record<string, CutPreviewShapeFrame>>((frames, shape) => {
     const object = findShapeObject(state, shape.id);
@@ -5944,71 +6106,117 @@ function cutPreviewActualIntersectionGeometry(state: ThreeState, solid: Workplan
   }
 }
 
-function addCutPreviewOverlays(state: ThreeState, holeFrame: CutPreviewShapeFrame, solidFrames: CutPreviewShapeFrame[]) {
-  solidFrames.forEach((solidFrame) => {
-    if (!holeFrame.worldBounds.intersectsBox(solidFrame.worldBounds)) {
-      return;
-    }
+function createCutPreviewMesh(geometry: THREE.BufferGeometry) {
+  const preview = new THREE.Mesh(geometry, cutPreviewMaterial);
+  preview.name = "CutPreviewOverlay";
+  preview.renderOrder = 18;
+  preview.userData.cutPreview = true;
+  preview.raycast = () => undefined;
+  setObjectRenderLayer(preview, RENDER_LAYER_PREVIEWS);
+  freezeStaticObjectMatrices(preview);
+  return preview;
+}
 
-    const geometry = cutPreviewActualIntersectionGeometry(state, solidFrame.shape, holeFrame.shape);
-    if (!geometry) {
-      return;
-    }
-    const preview = new THREE.Mesh(
-      geometry,
-      new THREE.MeshBasicMaterial({
-        color: "#30363a",
-        transparent: true,
-        opacity: 0.34,
-        depthTest: false,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-      }),
-    );
-    preview.name = "CutPreviewOverlay";
-    preview.renderOrder = 18;
-    preview.userData.cutPreview = true;
-    preview.raycast = () => undefined;
-    setObjectRenderLayer(preview, RENDER_LAYER_PREVIEWS);
-    freezeStaticObjectMatrices(preview);
-    state.shapeLayer.add(preview);
+function cutPreviewPlacementKey(root: THREE.Object3D, signatures: Map<THREE.Object3D, string>) {
+  let signature = signatures.get(root);
+  if (signature === undefined) {
+    signature = cutPreviewObjectSignature(root);
+    signatures.set(root, signature);
+  }
+  return `${signature}@${root.matrixWorld.elements.map((value) => value.toFixed(5)).join(",")}`;
+}
+
+function cutPreviewPairKey(
+  solidObject: THREE.Object3D,
+  holeObject: THREE.Object3D,
+  hole: WorkplaneShape,
+  signatures: Map<THREE.Object3D, string>,
+) {
+  // The hole brush is padded by its own size, so the hole dimensions are part of the key.
+  return [
+    cutPreviewPlacementKey(solidObject, signatures),
+    cutPreviewPlacementKey(holeObject, signatures),
+    shapeWidth(hole),
+    hole.height,
+    shapeDepth(hole),
+  ].join("#");
+}
+
+function disposeCutPreviewEntry(entry: CutPreviewPairEntry) {
+  if (!entry.mesh) return;
+  entry.mesh.parent?.remove(entry.mesh);
+  entry.mesh.geometry.dispose();
+  entry.mesh = null;
+}
+
+// Takes the overlays out of the scene but keeps the cache, so the next sync can show them again
+// without running CSG for pairs that did not change.
+function detachCutPreviewOverlays(state: ThreeState) {
+  state.cutPreviewPairs.forEach((entry) => {
+    entry.mesh?.parent?.remove(entry.mesh);
   });
 }
 
 function clearCutPreviewOverlays(state: ThreeState) {
-  const overlays: THREE.Object3D[] = [];
-  state.shapeLayer.traverse((child) => {
-    if (child.userData.cutPreview) {
-      overlays.push(child);
-    }
-  });
-  overlays.forEach((overlay) => {
-    overlay.parent?.remove(overlay);
-    disposeObject(overlay);
-  });
+  state.cutPreviewPairs.forEach(disposeCutPreviewEntry);
+  state.cutPreviewPairs.clear();
 }
 
 function syncCutPreviewOverlays(state: ThreeState, shapes: WorkplaneShape[]) {
-  clearCutPreviewOverlays(state);
   const visibleShapes = shapes.filter((shape) => !shape.hidden);
   const cutFrames = shapeCutPreviewFrames(state, visibleShapes);
   const solidFrames = visibleShapes
     .filter((shape) => !shape.hole)
     .map((shape) => cutFrames[shape.id])
     .filter((frame): frame is CutPreviewShapeFrame => Boolean(frame));
+  const wanted = new Set<string>();
+  const signatures = new Map<THREE.Object3D, string>();
 
-  if (solidFrames.length === 0) {
-    return;
+  if (solidFrames.length > 0) {
+    visibleShapes.forEach((shape) => {
+      if (!shape.hole) {
+        return;
+      }
+      const holeFrame = cutFrames[shape.id];
+      const holeObject = holeFrame ? findShapeObject(state, shape.id) : null;
+      if (!holeFrame || !holeObject) {
+        return;
+      }
+      solidFrames.forEach((solidFrame) => {
+        if (!holeFrame.worldBounds.intersectsBox(solidFrame.worldBounds)) {
+          return;
+        }
+        const solidObject = findShapeObject(state, solidFrame.shape.id);
+        if (!solidObject) {
+          return;
+        }
+        const pairId = `${shape.id}|${solidFrame.shape.id}`;
+        wanted.add(pairId);
+        const key = cutPreviewPairKey(solidObject, holeObject, shape, signatures);
+        const cached = state.cutPreviewPairs.get(pairId);
+        if (cached && cached.key === key) {
+          if (cached.mesh && !cached.mesh.parent) {
+            state.shapeLayer.add(cached.mesh);
+          }
+          return;
+        }
+        if (cached) {
+          disposeCutPreviewEntry(cached);
+        }
+        const geometry = cutPreviewActualIntersectionGeometry(state, solidFrame.shape, shape);
+        const mesh = geometry ? createCutPreviewMesh(geometry) : null;
+        if (mesh) {
+          state.shapeLayer.add(mesh);
+        }
+        state.cutPreviewPairs.set(pairId, { key, mesh });
+      });
+    });
   }
 
-  visibleShapes.forEach((shape) => {
-    if (!shape.hole) {
-      return;
-    }
-    const holeFrame = cutFrames[shape.id];
-    if (holeFrame) {
-      addCutPreviewOverlays(state, holeFrame, solidFrames);
-    }
+  state.cutPreviewPairs.forEach((entry, pairId) => {
+    if (wanted.has(pairId)) return;
+    disposeCutPreviewEntry(entry);
+    state.cutPreviewPairs.delete(pairId);
   });
 }
 
@@ -6043,14 +6251,18 @@ function syncShapeObjectDimensions(object: THREE.Group, shape: WorkplaneShape) {
     );
   } else if (boxIsPlain(shape)) {
     scale = new THREE.Vector3(width, shape.height, depth);
-  } else if (shape.kind === "cylinder" || shape.kind === "polygon") {
+  } else if (cylinderIsPlain(shape) || shape.kind === "polygon") {
     scale = new THREE.Vector3(width / 2, shape.height, depth / 2);
   } else if (shape.kind === "sphere") {
     scale = new THREE.Vector3(width / 2, shape.height / 2, depth / 2);
   }
   if (!scale) return;
 
-  object.position.y = (shape.elevation ?? 0) + shape.height / 2;
+  const objectY = (shape.elevation ?? 0) + shape.height / 2;
+  if (object.position.y === objectY && surface.position.y === -shape.height / 2 && surface.scale.equals(scale)) {
+    return;
+  }
+  object.position.y = objectY;
   object.updateMatrix();
   surface.scale.copy(scale);
   surface.position.y = -shape.height / 2;
@@ -6130,11 +6342,13 @@ function rebuildShapes(
     return;
   }
 
-  clearCutPreviewOverlays(state);
+  // Overlays leave the scene here but their cache survives; the sync below re-adds unchanged pairs.
+  detachCutPreviewOverlays(state);
   const selected = new Set(selectedIds);
   const visibleShapes = shapes.filter((shape) => !shape.hidden);
 
   if (useOfficialModifierRendering) {
+    clearCutPreviewOverlays(state);
     disposeChildren(state.shapeLayer);
     state.shapeRecords.clear();
     state.officialShapeLayerActive = true;
@@ -6153,6 +6367,7 @@ function rebuildShapes(
   }
 
   if (state.officialShapeLayerActive) {
+    clearCutPreviewOverlays(state);
     disposeChildren(state.shapeLayer);
     state.shapeRecords.clear();
     state.officialShapeLayerActive = false;
@@ -6455,11 +6670,14 @@ function syncTransformOverlay(
   }
   const cameraDistance = state.camera.position.distanceTo(frame.center);
   const cameraInSelectionFrame = frameLocalPoint(frame, state.camera.position);
-  const cameraInsideSelection = isPointInsideTransformBounds(cameraInSelectionFrame, frame.min, frame.max);
+  // An orthographic camera sees both sides of its position (see ORTHOGRAPHIC_NEAR), so nothing
+  // is "behind" it and it is never "inside" the selection.
+  const orthographic = state.camera instanceof THREE.OrthographicCamera;
+  const cameraInsideSelection = !orthographic && isPointInsideTransformBounds(cameraInSelectionFrame, frame.min, frame.max);
   const project = (point: THREE.Vector3) => {
     const cameraSpace = point.clone().applyMatrix4(state.camera.matrixWorldInverse);
     const projected = cameraSpace.clone().applyMatrix4(state.camera.projectionMatrix);
-    return transformOverlayScreenPoint(projected, cameraSpace.z, rect.width, rect.height);
+    return transformOverlayScreenPoint(projected, orthographic ? -1 : cameraSpace.z, rect.width, rect.height);
   };
 
   const xFootAxis = frame.xAxis.clone().normalize();
@@ -6749,7 +6967,8 @@ function syncAlignOverlay(
     const projected = corner.clone().project(state.camera);
     return { cameraSpace, projected };
   });
-  const nearPlane = state.camera instanceof THREE.PerspectiveCamera ? state.camera.near : 0.1;
+  // Only a perspective camera has a "behind"; the orthographic one sees both sides (see ORTHOGRAPHIC_NEAR).
+  const nearPlane = state.camera instanceof THREE.PerspectiveCamera ? state.camera.near : Number.NEGATIVE_INFINITY;
   if (projectedCorners.some(({ cameraSpace, projected }) => cameraSpace.z > -nearPlane * 1.5 || !Number.isFinite(projected.x) || !Number.isFinite(projected.y))) {
     clear();
     return;
@@ -6856,7 +7075,8 @@ function syncMirrorOverlay(
     const projected = corner.clone().project(state.camera);
     return { cameraSpace, projected };
   });
-  const nearPlane = state.camera instanceof THREE.PerspectiveCamera ? state.camera.near : 0.1;
+  // Only a perspective camera has a "behind"; the orthographic one sees both sides (see ORTHOGRAPHIC_NEAR).
+  const nearPlane = state.camera instanceof THREE.PerspectiveCamera ? state.camera.near : Number.NEGATIVE_INFINITY;
   if (projectedCorners.some(({ cameraSpace, projected }) => cameraSpace.z > -nearPlane * 1.5 || !Number.isFinite(projected.x) || !Number.isFinite(projected.y))) {
     clear();
     return;
@@ -7257,6 +7477,11 @@ function sharedShapeMaterial(shape: WorkplaneShape) {
     roughness: shape.hole ? 0.88 : 0.57,
     metalness: 0.02,
     side: THREE.DoubleSide,
+    // Fork (see FORK.md): push surfaces slightly back so the full width of the shape outlines,
+    // which are centred on the edges, shows instead of half of it.
+    polygonOffset: true,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
   });
   material.userData.cached = true;
   material.userData.sharedShapeMaterialKey = key;
@@ -7415,9 +7640,15 @@ function createShapeObject(
       );
       break;
     }
-    case "cylinder":
+    case "cylinder": {
+      const hollow = hollowCylinderOptionsFromShape(shape, width, depth, height);
+      if (hollow) {
+        addMesh(group, sharedShapeGeometry(geometryCacheKey, () => buildHollowCylinderGeometry(hollow)), material, shape);
+        break;
+      }
       addMesh(group, sharedShapeGeometry(geometryCacheKey, () => new THREE.CylinderGeometry(1, 1, 1, shape.sides ?? 96, shape.segments ?? 1)), material, shape, undefined, undefined, new THREE.Vector3(width / 2, height, depth / 2));
       break;
+    }
     case "sphere": {
       const { widthSegments, heightSegments } = sphereTessellation(shape.steps);
       addMesh(group, sharedShapeGeometry(geometryCacheKey, () => new THREE.SphereGeometry(1, widthSegments, heightSegments)), material, shape, undefined, undefined, new THREE.Vector3(width / 2, height / 2, depth / 2));
@@ -7520,15 +7751,29 @@ function createShapeObject(
 }
 
 function createImagePlateMaterials(shape: WorkplaneShape, sideMaterial: THREE.MeshStandardMaterial, onTextureReady?: () => void) {
-  const sideMaterials = Array.from({ length: 5 }, (_, index) => (index === 0 ? sideMaterial : sideMaterial.clone()));
-  const topMaterial = new THREE.MeshStandardMaterial({
-    color: "#ffffff",
-    roughness: 0.64,
-    metalness: 0,
-    transparent: true,
-    alphaTest: 0.02,
-    side: THREE.FrontSide,
-  });
+  // Fork (see FORK.md): a reference image shows only its picture, translucent and from both
+  // sides, unlit so the photo keeps its colours; the thin box around it is invisible.
+  const reference = isReferenceImage(shape);
+  const hiddenSide = reference ? new THREE.MeshBasicMaterial({ visible: false }) : null;
+  const sideMaterials = Array.from({ length: 5 }, (_, index) => hiddenSide ?? (index === 0 ? sideMaterial : sideMaterial.clone()));
+  const topMaterial: THREE.MeshStandardMaterial | THREE.MeshBasicMaterial = reference
+    ? new THREE.MeshBasicMaterial({
+        color: "#ffffff",
+        transparent: true,
+        opacity: referenceImageOpacity(shape),
+        // Writes depth so the workplane grid behind the photo doesn't draw over it.
+        depthWrite: true,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+      })
+    : new THREE.MeshStandardMaterial({
+        color: "#ffffff",
+        roughness: 0.64,
+        metalness: 0,
+        transparent: true,
+        alphaTest: 0.02,
+        side: THREE.FrontSide,
+      });
 
   if (shape.imagePlate?.dataUrl) {
     const texture = imageTextureLoader.load(shape.imagePlate.dataUrl, () => {
@@ -7648,7 +7893,7 @@ function addMesh(
   if (group.userData.acceleratedPicking !== false && !shape.edgeTreatments?.length) {
     enableAcceleratedMeshPicking(mesh, prepared, Boolean(shape.importedMesh));
   }
-  mesh.castShadow = true;
+  mesh.castShadow = !isReferenceImage(shape);
   mesh.receiveShadow = false;
   if (position) {
     mesh.position.copy(position);
@@ -7671,16 +7916,27 @@ function addShapeEdgeDecorations(group: THREE.Group, mesh: THREE.Mesh, prepared:
     ["cone", "pyramid", "roof", "roundRoof", "halfSphere", "torus", "tube", "ring", "gear", "wedge"].includes(shape.kind);
   const importedTriangleCount = shape.importedMesh?.triangleCount ?? 0;
   const skipHeavyImportedEdges = Boolean(shape.importedMesh) && importedTriangleCount > IMPORTED_SELECTED_EDGE_TRIANGLE_LIMIT;
-  if ((group.userData.showEdges || complexEdges) && !skipHeavyImportedEdges) {
+  // Reference images (fork) have no outline unless selected.
+  if (isReferenceImage(shape) && !group.userData.showEdges) return;
+  // Fork change (see FORK.md): every shape gets an outline in a darker shade of its own colour
+  // along its creases (faces meeting at more than SHAPE_OUTLINE_ANGLE), so overlapping shapes
+  // stay readable. Upstream outlined only complex shapes, in thin dark grey.
+  if (!skipHeavyImportedEdges) {
     const selectedOutline = Boolean(group.userData.showEdges);
     const selectedRoundedBox = selectedOutline && shape.kind === "box" && Boolean(shape.radius && shape.radius > 0);
-    const edgeColor = selectedOutline ? "#00aeea" : shape.hole ? "#697989" : complexEdges ? "#141b21" : darkenHex(shape.color, 0.34);
-    const edgeOpacity = selectedRoundedBox ? 0 : selectedOutline ? 0.98 : shape.hole ? 0.44 : complexEdges ? 0.38 : shape.kind === "text" ? 0.86 : 0.2;
+    const edgeColor = selectedOutline ? "#00aeea" : shape.hole ? "#697989" : darkenHex(shape.color, SHAPE_OUTLINE_DARKEN);
+    const edgeOpacity = selectedRoundedBox ? 0 : selectedOutline ? 0.98 : shape.hole ? 0.44 : SHAPE_OUTLINE_OPACITY;
     if (selectedOutline && shape.importedMesh && shape.cadDisplayEdgesVersion === 2 && Boolean(shape.cadDisplayEdges?.length)) {
       addCadDisplayEdges(group, shape, edgeColor, edgeOpacity);
     } else {
       const selectedThreshold = shape.importedMesh ? NORMAL_IMPORTED_SELECTION_EDGE_ANGLE : 1;
-      const edges = new THREE.LineSegments(getEdgesGeometry(shape, prepared, selectedOutline ? selectedThreshold : complexEdges ? 14 : 25), sharedLineMaterial(edgeColor, edgeOpacity));
+      const edgeGeometry = getEdgesGeometry(shape, prepared, selectedOutline ? selectedThreshold : SHAPE_OUTLINE_ANGLE);
+      // The selection outline stays a thin line; regular outlines are 2 px fat lines. They are
+      // not pickable themselves: clicks go to the shape surface they outline.
+      const edges = selectedOutline
+        ? new THREE.LineSegments(edgeGeometry, sharedLineMaterial(edgeColor, edgeOpacity))
+        : new LineSegments2(shapeOutlineGeometry(edgeGeometry), sharedShapeOutlineMaterial(edgeColor, edgeOpacity));
+      if (!selectedOutline) edges.raycast = () => undefined;
       edges.userData.complexEdge = complexEdges;
       edges.userData.shapeDecoration = true;
       edges.userData.shapeEdge = true;

@@ -24,8 +24,16 @@ import {
 import { displayStepFromMillimeters, displayToMillimeters, formatMeasurementNumber, lengthDisplayUnit, millimetersToDisplay, parseMeasurementInput } from "@/lib/measurementUnits";
 import { resizedShapeSize, shapeDepth, shapeHasTaper, shapeOverallFootprintDimensions, shapeTaperDimensions, shapeWidth } from "@/lib/workplaneShapes";
 import { boxCornerStyle, maxBoxFloor, maxBoxWall } from "@/lib/boxGeometry";
+import { maxCylinderFloor, maxCylinderWall } from "@/lib/cylinderGeometry";
 import { validateLatchBoxParams } from "@/lib/latchBox";
 import { latchBoxPropertyGroups, type LatchBoxPropertyGroup } from "@/lib/latchBoxInspector";
+import { validateDovetailParams } from "@/lib/dovetail";
+import { dovetailPropertyGroups } from "@/lib/dovetailInspector";
+import { asteriskPropertyGroups } from "@/lib/asteriskInspector";
+import { validateSlidingLidBoxParams } from "@/lib/slidingLidBox";
+import { slidingLidBoxPropertyGroups } from "@/lib/slidingLidBoxInspector";
+import { isSlidingLidBoxShape } from "@/lib/slidingLidBoxShapes";
+import { isReferenceImage, MIN_REFERENCE_IMAGE_OPACITY, referenceImageOpacity } from "@/lib/referenceImage";
 import { isLatchBoxShape } from "@/lib/latchBoxShapes";
 import { normalizeSketchRevolveSettings } from "@/lib/sketchRevolve";
 import { MAX_HIGH_RESOLUTION_SIDES } from "@/lib/workplaneSettings";
@@ -184,7 +192,8 @@ function getShapePropertiesWithAppLimits(shape: WorkplaneShape, onUpdate: ShapeI
   if (shape.kind === "box") {
     // Fork feature (see FORK.md): corner rounding style and radius live in the main list;
     // hollow-box settings are in their own card.
-    const cornerMax = Math.max(0, Math.min(width, depth, shape.height) / 2);
+    // Vertical rounding only touches the side edges, so the height does not limit it.
+    const cornerMax = Math.max(0, Math.min(width, depth, boxCornerStyle(shape) === "vertical" ? Number.POSITIVE_INFINITY : shape.height) / 2);
     return [
       {
         type: "select",
@@ -400,6 +409,8 @@ export function ShapeInspector({
   onEditSketch,
   canSeparateParts = false,
   onSeparateParts,
+  onOffset,
+  onFillHollow,
   onInteractionActiveChange,
 }: {
   shape: WorkplaneShape;
@@ -412,6 +423,8 @@ export function ShapeInspector({
   onEditSketch?: () => void;
   canSeparateParts?: boolean;
   onSeparateParts?: () => void;
+  onOffset?: (distance: number) => void;
+  onFillHollow?: (clearance: number) => void;
   onInteractionActiveChange?: (active: boolean) => void;
 }) {
   const solidColor = shape.color;
@@ -463,7 +476,12 @@ export function ShapeInspector({
   const inspectorRef = useRef<HTMLElement>(null);
   const [propertiesOpen, setPropertiesOpen] = useState(true);
   const [taperOpen, setTaperOpen] = useState(false);
-  const [hollowOpen, setHollowOpen] = useState(() => Boolean(shape.boxWall && shape.boxWall > 0));
+  const [hollowOpen, setHollowOpen] = useState(() => Boolean((shape.boxWall ?? 0) > 0 || (shape.cylinderWall ?? 0) > 0));
+  // Fork (see FORK.md): Grow / Shrink card, closed until needed.
+  const [offsetOpen, setOffsetOpen] = useState(false);
+  const [offsetDistance, setOffsetDistance] = useState(0.1);
+  const [fillOpen, setFillOpen] = useState(false);
+  const [fillClearance, setFillClearance] = useState(0.1);
   // Fork features (see FORK.md): hollow boxes and the latch box generator.
   const hollowProperties: ShapePropertyConfig[] = shape.kind === "box" ? [
     {
@@ -482,11 +500,76 @@ export function ShapeInspector({
       step: 0.1,
       onChange: (boxFloor) => onUpdate({ boxFloor }),
     },
+  ] : shape.kind === "cylinder" ? [
+    // Fork feature (see FORK.md): hollow cylinders. Floor 0 leaves the bottom open (a tube).
+    {
+      label: "Wall Thickness",
+      value: shape.cylinderWall ?? 0,
+      min: 0,
+      max: maxCylinderWall(shapeWidth(shape), shapeDepth(shape)),
+      step: 0.1,
+      unit: "mm",
+      onChange: (cylinderWall) => onUpdate({ cylinderWall: cylinderWall > 0 ? cylinderWall : undefined }),
+    },
+    {
+      label: "Floor Thickness",
+      value: shape.cylinderFloor ?? shape.cylinderWall ?? 0,
+      min: 0,
+      max: maxCylinderFloor(shape.height),
+      step: 0.1,
+      unit: "mm",
+      onChange: (cylinderFloor) => onUpdate({ cylinderFloor }),
+    },
   ] : [];
-  const latchBoxGroups: LatchBoxPropertyGroup[] | null = isLatchBoxShape(shape)
-    ? latchBoxPropertyGroups(shape.latchBox.params, (params) => onUpdate({ latchBox: { ...shape.latchBox, params } }))
+  // Generated parts (latch box, dovetail, sliding lid box) replace the Properties and Taper cards
+  // with their parameters.
+  const dovetail = shape.dovetail;
+  const referenceImage = isReferenceImage(shape);
+  // Reference image (fork): opacity, and width/length that keep the photo's aspect ratio.
+  const referenceImageGroups: LatchBoxPropertyGroup[] | null = referenceImage && shape.imagePlate
+    ? (() => {
+        const plate = shape.imagePlate;
+        const width = shapeWidth(shape);
+        const depth = shapeDepth(shape);
+        const aspect = depth / Math.max(MIN_SHAPE_SIZE, width);
+        const resize = (nextWidth: number) => {
+          const nextDepth = nextWidth * aspect;
+          return { width: nextWidth, depth: nextDepth, size: Math.max(nextWidth, nextDepth) };
+        };
+        return [{
+          title: "Reference Image",
+          properties: [
+            {
+              label: "Opacity (%)",
+              value: Math.round(referenceImageOpacity(shape) * 100),
+              min: Math.round(MIN_REFERENCE_IMAGE_OPACITY * 100),
+              max: 100,
+              step: 1,
+              unit: "none",
+              onChange: (percent) => onUpdate({ imagePlate: { ...plate, opacity: Math.min(1, Math.max(MIN_REFERENCE_IMAGE_OPACITY, percent / 100)) } }),
+            },
+            { label: "Width", value: width, min: 1, max: 2000, step: 0.5, unit: "mm", onChange: (value) => onUpdate(resize(value)) },
+            { label: "Length", value: depth, min: 1, max: 2000, step: 0.5, unit: "mm", onChange: (value) => onUpdate(resize(value / aspect)) },
+          ],
+        }];
+      })()
     : null;
-  const latchBoxErrors = isLatchBoxShape(shape) ? validateLatchBoxParams(shape.latchBox.params) : [];
+  const latchBoxGroups: LatchBoxPropertyGroup[] | null = referenceImageGroups ?? (isLatchBoxShape(shape)
+    ? latchBoxPropertyGroups(shape.latchBox.params, (params) => onUpdate({ latchBox: { ...shape.latchBox, params } }))
+    : isSlidingLidBoxShape(shape)
+      ? slidingLidBoxPropertyGroups(shape.slidingLidBox.params, (params) => onUpdate({ slidingLidBox: { ...shape.slidingLidBox, params } }))
+      : dovetail
+        ? dovetailPropertyGroups(dovetail, (params) => onUpdate({ dovetail: params }))
+        : shape.asterisk
+          ? asteriskPropertyGroups(shape.asterisk, (params) => onUpdate({ asterisk: params }))
+          : null);
+  const latchBoxErrors = isLatchBoxShape(shape)
+    ? validateLatchBoxParams(shape.latchBox.params)
+    : isSlidingLidBoxShape(shape)
+      ? validateSlidingLidBoxParams(shape.slidingLidBox.params)
+      : dovetail
+        ? validateDovetailParams(dovetail)
+        : [];
   const [gearTeethOpen, setGearTeethOpen] = useState(true);
   const [gearHelixOpen, setGearHelixOpen] = useState(true);
   const [colorOpen, setColorOpen] = useState(false);
@@ -537,6 +620,8 @@ export function ShapeInspector({
 
       {!minimized ? (
         <>
+      {/* Reference images (fork) are never solids or holes. */}
+      {!referenceImage ? (
       <div className="shape-state-card" role="group" aria-label="Shape mode">
         <button
           className={!shape.hole ? "active solid-choice" : "solid-choice"}
@@ -565,6 +650,9 @@ export function ShapeInspector({
           <span>Hole</span>
         </button>
       </div>
+      ) : (
+        <p className="property-hint reference-image-hint">Reference photo: shown in the editor only, never exported or printed. Rotate it to stand it up as a side view.</p>
+      )}
 
       {colorOpen ? (
         <div className="color-card" aria-label="Shape color">
@@ -652,7 +740,7 @@ export function ShapeInspector({
         ) : null}
       </div>
       )}
-      {shape.kind === "box" ? (
+      {(shape.kind === "box" || shape.kind === "cylinder") && !referenceImage ? (
         <div className={`property-card ${hollowOpen ? "" : "collapsed"}`}>
           <button
             className="property-card-header"
@@ -666,8 +754,71 @@ export function ShapeInspector({
           </button>
           {hollowOpen ? (
             <div className="property-list" id={`hollow-${shape.id}`}>
-              <p className="property-hint">Wall above 0 opens the top and keeps a floor of the given thickness. Rounded corners follow the wall inside.</p>
+              <p className="property-hint">
+                {shape.kind === "cylinder"
+                  ? "Wall thickness above 0 opens the top. Floor thickness 0 leaves the bottom open too (a tube)."
+                  : "Wall above 0 opens the top and keeps a floor of the given thickness. Rounded corners follow the wall inside."}
+              </p>
               <ShapePropertyRows properties={hollowProperties} workspace={workspace} disabled={locked} onInteractionActiveChange={onInteractionActiveChange} />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {onOffset && !isReferenceImage(shape) ? (
+        <div className={`property-card ${offsetOpen ? "" : "collapsed"}`}>
+          <button
+            className="property-card-header"
+            type="button"
+            aria-expanded={offsetOpen}
+            aria-controls={`offset-${shape.id}`}
+            onClick={() => setOffsetOpen((open) => !open)}
+          >
+            <span>Grow / Shrink</span>
+            <ChevronUp className={offsetOpen ? "" : "collapsed"} size={25} strokeWidth={2.8} />
+          </button>
+          {offsetOpen ? (
+            <div className="property-list" id={`offset-${shape.id}`}>
+              <p className="property-hint">
+                Moves every face outward by the distance (negative shrinks), e.g. a shaft into the hole it fits in plus a tolerance. The shape becomes a mesh; its own settings can no longer be edited.
+              </p>
+              <ShapePropertyRows
+                properties={[{ label: "Distance", value: offsetDistance, min: -5, max: 5, step: 0.05, unit: "mm", onChange: setOffsetDistance }]}
+                workspace={workspace}
+                disabled={locked}
+                onInteractionActiveChange={onInteractionActiveChange}
+              />
+              <button className="inspector-action-button" type="button" disabled={locked || offsetDistance === 0} onClick={() => onOffset(offsetDistance)}>
+                <span>{offsetDistance < 0 ? "Shrink" : "Grow"} by {Math.abs(offsetDistance)} mm</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {onFillHollow && !isReferenceImage(shape) ? (
+        <div className={`property-card ${fillOpen ? "" : "collapsed"}`}>
+          <button
+            className="property-card-header"
+            type="button"
+            aria-expanded={fillOpen}
+            aria-controls={`fill-${shape.id}`}
+            onClick={() => setFillOpen((open) => !open)}
+          >
+            <span>Fill Hollow</span>
+            <ChevronUp className={fillOpen ? "" : "collapsed"} size={25} strokeWidth={2.8} />
+          </button>
+          {fillOpen ? (
+            <div className="property-list" id={`fill-${shape.id}`}>
+              <p className="property-hint">
+                Adds a new solid that fills this shape&apos;s hollow part (a lid or plug that fits into it), made smaller by the clearance. The hollow is the empty space inside the shape&apos;s outline; if there are several, the largest is used.
+              </p>
+              <ShapePropertyRows
+                properties={[{ label: "Clearance", value: fillClearance, min: 0, max: 2, step: 0.05, unit: "mm", onChange: setFillClearance }]}
+                workspace={workspace}
+                onInteractionActiveChange={onInteractionActiveChange}
+              />
+              <button className="inspector-action-button" type="button" onClick={() => onFillHollow(fillClearance)}>
+                <span>Create fill</span>
+              </button>
             </div>
           ) : null}
         </div>

@@ -1,3 +1,5 @@
+import { boxIsPlain } from "@/lib/boxGeometry";
+import { cylinderHollowFloor, cylinderHollowWall } from "@/lib/cylinderGeometry";
 import type { WorkplaneShape } from "@/types/sketchforge";
 import { shapeDepth, shapeWidth } from "@/lib/workplaneShapes";
 import { loadBrepWithOcct, type Brep, type BrepSolid } from "@/lib/brepKernel";
@@ -54,6 +56,11 @@ function buildExactSolid(brep: Brep, shape: WorkplaneShape): BuildOutcome {
   let solid: BrepSolid;
   switch (shape.kind) {
     case "box": {
+      // Fork (see FORK.md): rounded and hollow boxes have no exact mapping here yet; report
+      // them as skipped instead of silently exporting a plain box.
+      if (!boxIsPlain(shape)) {
+        return { skip: "rounded or hollow box has no exact B-Rep mapping; export as STL or OBJ" };
+      }
       // brep.box maps args to (X, Y, Z); in the Y-up frame that is (width, height, depth).
       solid = brep.box(width, height, depth, { centered: true });
       break;
@@ -71,6 +78,18 @@ function buildExactSolid(brep: Brep, shape: WorkplaneShape): BuildOutcome {
         return { skip: "elliptical base is not an exact OCCT primitive" };
       }
       solid = brep.cylinder(width / 2, height, { axis: [0, 1, 0], centered: true });
+      // Hollow cylinder (fork feature, see cylinderGeometry.ts): cut the hole down to the floor
+      // (through the bottom when the floor is 0), overshooting open faces by 1 mm.
+      const wall = cylinderHollowWall(shape);
+      if (wall > 0) {
+        const floor = cylinderHollowFloor(shape, wall);
+        const bottom = floor > 0 ? -height / 2 + floor : -height / 2 - 1;
+        const top = height / 2 + 1;
+        const inner = brep.translate(brep.cylinder(width / 2 - wall, top - bottom, { axis: [0, 1, 0], centered: true }), [0, (top + bottom) / 2, 0]);
+        const cut = brep.cutAll(solid, [inner]);
+        if (!cut.ok) return { skip: "hollow cylinder cut failed" };
+        solid = cut.value;
+      }
       break;
     }
     case "cone": {

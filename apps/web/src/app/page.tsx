@@ -3,6 +3,7 @@
 import { Clock3, EllipsisVertical, FileUp, FolderKanban, Grid3X3, HomeIcon, List, Palette, Pencil, Plus, RefreshCw, Search, Settings, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SketchForgeEditor, importedShapeFromObj, importedShapeFromStl, importedShapeFromSvg } from "@/components/SketchForgeEditor";
+import { importedShapeFrom3mf } from "@/lib/threeMfImport";
 import ChallengesDashboard from "@/components/official/ChallengesDashboard";
 import { applyAppTheme, readStoredAppTheme, resolveAppTheme, storeAppTheme, type AppThemePreference, type ResolvedAppTheme } from "@/lib/appTheme";
 import type { AppUpdateStatus } from "@/lib/appUpdates";
@@ -1069,7 +1070,7 @@ export default function Home() {
       const projectFiles = files.filter((file) => /\.skf$/i.test(file.name));
       if (projectFiles.length) {
         if (files.length !== 1) {
-          setDashboardNotice("Open one .skf project at a time; import STL, OBJ, STEP, and SVG geometry separately");
+          setDashboardNotice("Open one .skf project at a time; import STL, OBJ, 3MF, STEP, and SVG geometry separately");
           return;
         }
         await openSkfProjectFromFile(projectFiles[0]);
@@ -1099,9 +1100,11 @@ export default function Home() {
             ? await import("@/lib/stepImport").then(({ importedShapeFromStep }) => importedShapeFromStep(file.name, buffer))
             : isObj
               ? importedShapeFromObj(file.name, new TextDecoder().decode(bytes))
-              : isSvg
-                ? importedShapeFromSvg(file.name, new TextDecoder().decode(bytes))
-                : importedShapeFromStl(file.name, buffer);
+              : sourceFormat === "3mf"
+                ? importedShapeFrom3mf(file.name, bytes)
+                : isSvg
+                  ? importedShapeFromSvg(file.name, new TextDecoder().decode(bytes))
+                  : importedShapeFromStl(file.name, buffer);
           const asset = await projectAssetFromBytes(file.name, sourceFormat, bytes, file.type);
           importedShapes.push(attachProjectAsset(parsedShape, asset.id));
           importedAssets.push(asset);
@@ -1228,7 +1231,7 @@ export default function Home() {
         className="hidden-file-input"
         type="file"
         multiple
-        accept=".skf,.stl,.obj,.step,.stp,.svg,image/svg+xml"
+        accept=".skf,.stl,.obj,.3mf,.step,.stp,.svg,image/svg+xml"
         onChange={(event) => {
           const files = event.currentTarget.files ? Array.from(event.currentTarget.files) : [];
           if (files.length) {

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { appendEditorHistorySnapshot, editorHistoryEntry } from "@/lib/editorHistory";
-import { createKeyboardMovementInteraction, moveShapesByKeyboard, type KeyboardMovementEvent } from "@/lib/keyboardMovement";
+import { createKeyboardMovementInteraction, moveShapesByKeyboard, type KeyboardMovementEvent, type KeyboardMovementView } from "@/lib/keyboardMovement";
 import { horizontalPlacementWorkplane, type PlacementWorkplane } from "@/lib/placementWorkplane";
 import type { WorkplaneShape } from "@/types/sketchforge";
 
@@ -150,4 +150,78 @@ describe("keyboard movement interactions", () => {
     const raised = moveShapesByKeyboard(nudged, ["box"], key("ArrowUp", { ctrlKey: true }), plane);
     expect(raised[0]).toMatchObject({ x: 0, z: 1, elevation: 5 });
   });
+
+  describe("relative to the camera view", () => {
+    const plane = horizontalPlacementWorkplane();
+    // Camera basis from yaw (orbit around Y, 0 = default front view looking toward -Z) and pitch (down tilt).
+    function view(yawDegrees: number, pitchDegrees = 45): KeyboardMovementView {
+      const yaw = (yawDegrees * Math.PI) / 180;
+      const pitch = (pitchDegrees * Math.PI) / 180;
+      const right = { x: Math.cos(yaw), y: 0, z: -Math.sin(yaw) };
+      const flat = { x: -Math.sin(yaw), y: 0, z: -Math.cos(yaw) };
+      const forward = { x: flat.x * Math.cos(pitch), y: -Math.sin(pitch), z: flat.z * Math.cos(pitch) };
+      const up = { x: flat.x * Math.sin(pitch), y: Math.cos(pitch), z: flat.z * Math.sin(pitch) };
+      return { right, up, forward };
+    }
+    function moved(name: string, camera: KeyboardMovementView, modifiers: Partial<KeyboardMovementEvent> = {}) {
+      const [shape] = moveShapesByKeyboard([box()], ["box"], key(name, modifiers), plane, camera);
+      return { x: shape.x, z: shape.z, elevation: shape.elevation };
+    }
+
+    it("matches the fixed axes in the default view", () => {
+      expect(moved("ArrowRight", view(0))).toEqual({ x: 1, z: 0, elevation: 0 });
+      expect(moved("ArrowUp", view(0))).toEqual({ x: 0, z: -1, elevation: 0 });
+    });
+
+    it.each([
+      [90, { right: { x: 0, z: -1 }, up: { x: -1, z: 0 } }],
+      [180, { right: { x: -1, z: 0 }, up: { x: 0, z: 1 } }],
+      [-90, { right: { x: 0, z: 1 }, up: { x: 1, z: 0 } }],
+      [30, { right: { x: 1, z: 0 }, up: { x: 0, z: -1 } }],
+      [60, { right: { x: 0, z: -1 }, up: { x: -1, z: 0 } }],
+    ])("follows the screen after orbiting %s degrees", (yaw, expected) => {
+      expect(moved("ArrowRight", view(yaw))).toMatchObject(expected.right);
+      expect(moved("ArrowLeft", view(yaw))).toMatchObject({ x: -expected.right.x || 0, z: -expected.right.z || 0 });
+      expect(moved("ArrowUp", view(yaw))).toMatchObject(expected.up);
+      expect(moved("ArrowDown", view(yaw))).toMatchObject({ x: -expected.up.x || 0, z: -expected.up.z || 0 });
+    });
+
+    it("moves away from the camera on ArrowUp from top-down and edge-on views", () => {
+      expect(moved("ArrowUp", view(90, 90))).toMatchObject({ x: -1, z: 0 });
+      expect(moved("ArrowUp", view(90, 0))).toMatchObject({ x: -1, z: 0 });
+    });
+
+    it("keeps Ctrl/Cmd+ArrowUp along the workplane normal", () => {
+      expect(moved("ArrowUp", view(135), { ctrlKey: true })).toEqual({ x: 0, z: 0, elevation: 1 });
+    });
+  });
+
+  describe("step size", () => {
+    const plane = horizontalPlacementWorkplane();
+    const moved = (gridStep: number | undefined, modifiers: Partial<KeyboardMovementEvent> = {}, name = "ArrowRight") =>
+      moveShapesByKeyboard([box()], ["box"], key(name, modifiers), plane, null, gridStep)[0];
+
+    it.each([
+      [0.5, 0.5],
+      [2, 2],
+      [5, 5],
+      [8, 8],
+      [0, 1],
+    ])("moves one snap-grid step of %s mm (%s mm)", (gridStep, expected) => {
+      expect(moved(gridStep).x).toBe(expected);
+      expect(moved(gridStep, { shiftKey: true }).x).toBe(expected * 5);
+      expect(moved(gridStep, { ctrlKey: true }, "ArrowUp").elevation).toBe(expected);
+    });
+
+    it("keeps the upstream 1 mm step when no grid is given", () => {
+      expect(moved(undefined).x).toBe(1);
+    });
+
+    it("does not accumulate float noise with fine steps", () => {
+      let shapes = [box()];
+      for (let i = 0; i < 3; i++) shapes = moveShapesByKeyboard(shapes, ["box"], key("ArrowRight"), plane, null, 0.1);
+      expect(shapes[0].x).toBe(0.3);
+    });
+  });
 });
+

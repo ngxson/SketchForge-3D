@@ -177,6 +177,16 @@ export function workplaneSettingsFingerprint(workspace: WorkplaneWorkspaceSettin
   return JSON.stringify({ workspace, snapGrid });
 }
 
+/**
+ * Fingerprint the viewport waits for after hydrating settings from props, so that state change
+ * isn't echoed back to the parent. Fork fix (see FORK.md): when the hydrated settings equal the
+ * current ones no state change follows, so there is nothing to wait for (null); waiting anyway
+ * swallowed every later change.
+ */
+export function workspaceHydrationPendingFingerprint(currentFingerprint: string, hydratedFingerprint: string) {
+  return currentFingerprint === hydratedFingerprint ? null : hydratedFingerprint;
+}
+
 export function workspaceHydrationSyncDecision(pendingFingerprint: string | null, currentFingerprint: string) {
   if (pendingFingerprint === null) {
     return { shouldSync: true, pendingFingerprint: null };

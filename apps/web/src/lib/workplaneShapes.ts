@@ -302,7 +302,12 @@ export function workplaneShapesEqual(a: WorkplaneShape, b: WorkplaneShape) {
     a.boxCorners === b.boxCorners &&
     a.boxWall === b.boxWall &&
     a.boxFloor === b.boxFloor &&
+    a.cylinderWall === b.cylinderWall &&
+    a.cylinderFloor === b.cylinderFloor &&
     a.latchBox === b.latchBox &&
+    a.dovetail === b.dovetail &&
+    a.asterisk === b.asterisk &&
+    a.slidingLidBox === b.slidingLidBox &&
     a.locked === b.locked &&
     a.hidden === b.hidden
   );

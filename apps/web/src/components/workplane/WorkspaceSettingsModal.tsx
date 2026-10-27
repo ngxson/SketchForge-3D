@@ -7,7 +7,7 @@ import { HexColorInput, HexColorPicker } from "react-colorful";
 import { APP_THEME_OPTIONS, type AppThemePreference } from "@/lib/appTheme";
 import { gearCenterHoleLimits, gearToothPitch } from "@/lib/gearGeometry";
 import { normalizeScaleForUnits, parseMeasurementInput, scaleOptionsForUnits, WORKSPACE_UNIT_OPTIONS } from "@/lib/measurementUnits";
-import { shapeAssetDefaultDimensions, shapeAssetSpecialDefaults, toolbarShapeAssets } from "@/lib/shapeCatalog";
+import { ASTERISK_ASSET_ID, DOVETAIL_ASSET_ID, HOLLOW_CYLINDER_ASSET_ID, SLIDING_LID_BOX_ASSET_ID, TETRAHEDRON_ASSET_ID, shapeAssetDefaultDimensions, shapeAssetSpecialDefaults, toolbarShapeAssets } from "@/lib/shapeCatalog";
 import { DEFAULT_WORKPLANE_WORKSPACE, MAX_CUSTOM_SHAPE_DIMENSION, MAX_HIGH_RESOLUTION_SIDES, MIN_CUSTOM_SHAPE_DIMENSION } from "@/lib/workplaneSettings";
 import type { GearType, GridSize, ShapeCustomization, ShapeKind, WorkplaneWorkspaceSettings } from "@/types/sketchforge";
 
@@ -483,7 +483,9 @@ export function WorkspaceSettingsModal({
                     <span className="workspace-shape-picker-control">
                       <img src={selectedShapeAsset.menuIcon} alt="" />
                       <select value={selectedShapeKind} onChange={(event) => setSelectedShapeKind(event.currentTarget.value as ShapeKind)}>
-                        {toolbarShapeAssets.map((asset) => (
+                        {/* Fork entries without a per-kind customization of their own: tetrahedron, dovetail,
+                            sliding lid box and asterisk are generated meshes; the hollow cylinder shares the Cylinder's. */}
+                        {toolbarShapeAssets.filter((asset) => asset.id !== TETRAHEDRON_ASSET_ID && asset.id !== DOVETAIL_ASSET_ID && asset.id !== HOLLOW_CYLINDER_ASSET_ID && asset.id !== SLIDING_LID_BOX_ASSET_ID && asset.id !== ASTERISK_ASSET_ID).map((asset) => (
                           <option key={asset.kind} value={asset.kind}>
                             {asset.name}{workspace.shapeCustomizations[asset.kind] ? " — customized" : ""}
                           </option>

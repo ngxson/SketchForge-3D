@@ -111,7 +111,7 @@ export async function sha256Hex(bytes: Uint8Array) {
 
 export function sourceFormatForFileName(fileName: string): ProjectAssetSourceFormat | null {
   const extension = fileName.split(".").pop()?.toLowerCase();
-  if (extension === "stl" || extension === "obj" || extension === "svg") return extension;
+  if (extension === "stl" || extension === "obj" || extension === "svg" || extension === "3mf") return extension;
   if (extension === "step" || extension === "stp") return "step";
   return null;
 }
@@ -120,6 +120,7 @@ export function defaultMediaTypeForSource(format: ProjectAssetSourceFormat) {
   if (format === "svg") return "image/svg+xml";
   if (format === "step") return "application/step";
   if (format === "obj") return "model/obj";
+  if (format === "3mf") return "model/3mf";
   return "model/stl";
 }
 

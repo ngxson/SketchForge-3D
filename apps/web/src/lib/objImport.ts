@@ -101,13 +101,19 @@ function generatedFaceNormals(positions: readonly number[]) {
   return normals;
 }
 
-function importedObjShapeFromTriangles(
+/**
+ * Mesh shape from a Y-up triangle soup: X/Z centred, base at y = 0. Shared by the OBJ importer
+ * and the fork's 3MF importer (see FORK.md); `format` names the source in errors and metadata.
+ */
+export function importedShapeFromTriangles(
   fileName: string,
   rawPositions: number[],
   rawNormals: number[] | undefined,
+  format: "obj" | "3mf" = "obj",
 ): WorkplaneShape {
+  const label = format.toUpperCase();
   if (rawPositions.length < 9 || rawPositions.length % 9 !== 0) {
-    throw new Error("OBJ has no readable mesh geometry");
+    throw new Error(`${label} has no readable mesh geometry`);
   }
 
   let minX = Number.POSITIVE_INFINITY;
@@ -133,7 +139,7 @@ function importedObjShapeFromTriangles(
   const sizeY = maxY - minY;
   const sizeZ = maxZ - minZ;
   const maxDimension = Math.max(sizeX, sizeY, sizeZ);
-  if (!Number.isFinite(maxDimension) || maxDimension <= 0) throw new Error("OBJ geometry is empty");
+  if (!Number.isFinite(maxDimension) || maxDimension <= 0) throw new Error(`${label} geometry is empty`);
 
   const centerX = (minX + maxX) / 2;
   const centerZ = (minZ + maxZ) / 2;
@@ -155,7 +161,7 @@ function importedObjShapeFromTriangles(
 
   return {
     id: createLocalId("uploaded-mesh"),
-    name: fileName.replace(/\.[^.]+$/, "") || "Imported OBJ",
+    name: fileName.replace(/\.[^.]+$/, "") || `Imported ${label}`,
     kind: "mesh",
     color: "#0098c7",
     x: 10,
@@ -174,7 +180,7 @@ function importedObjShapeFromTriangles(
       baseDepth: depth,
       baseHeight: height,
       triangleCount: rawPositions.length / 9,
-      sourceFormat: "obj",
+      sourceFormat: format,
     },
     locked: false,
     hidden: false,
@@ -250,7 +256,7 @@ export function importedShapeFromObj(fileName: string, source: string): Workplan
     throw new Error("OBJ has no readable mesh geometry");
   }
 
-  return importedObjShapeFromTriangles(
+  return importedShapeFromTriangles(
     fileName,
     rawPositions,
     hasCompleteNormals && rawNormals.length === rawPositions.length ? rawNormals : undefined,

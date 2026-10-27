@@ -1,4 +1,5 @@
 import { boxCornerStyle, maxBoxFloor, maxBoxWall, MIN_BOX_WALL, type BoxCornerStyle } from "@/lib/boxGeometry";
+import { cylinderHollowFloor, cylinderHollowWall } from "@/lib/cylinderGeometry";
 import type { MeshPoint } from "@/lib/meshCoordinates";
 import type { OpenScadInputFile } from "@/lib/openscadTypes";
 import { cadSketchRegions } from "@/lib/sketchCadProfile";
@@ -240,8 +241,21 @@ class Emitter {
         return outer;
       }
       case "cylinder": {
-        const body: Stmt = [`cylinder(h = ${num(h)}, d = ${num(w)}, center = true${sidesFn(shape)});`];
-        return nearly(w, d) ? body : prefix(`scale(${vec([1, d / w, 1])})`, body);
+        const ellipse = (cw: number, cd: number, ch: number): Stmt => {
+          const body: Stmt = [`cylinder(h = ${num(ch)}, d = ${num(cw)}, center = true${sidesFn(shape)});`];
+          return nearly(cw, cd) ? body : prefix(`scale(${vec([1, cd / cw, 1])})`, body);
+        };
+        // Hollow cylinder (fork feature, see cylinderGeometry.ts): cut the hole from the top,
+        // down to the floor; with floor 0 it runs through. The cut overshoots open faces by 1 mm.
+        const wall = cylinderHollowWall({ ...shape, width: w, depth: d });
+        if (wall > 0) {
+          const floor = cylinderHollowFloor({ cylinderFloor: shape.cylinderFloor, height: h }, wall);
+          const bottom = floor > 0 ? -h / 2 + floor : -h / 2 - 1;
+          const top = h / 2 + 1;
+          const inner = ellipse(w - 2 * wall, d - 2 * wall, top - bottom);
+          return block("difference()", [ellipse(w, d, h), prefix(`translate([0, 0, ${num((top + bottom) / 2)}])`, inner)]);
+        }
+        return ellipse(w, d, h);
       }
       case "sphere":
         return nearly(w, d) && nearly(w, h)

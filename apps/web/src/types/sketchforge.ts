@@ -1,4 +1,7 @@
+import type { AsteriskParams } from "@/lib/asterisk";
+import type { DovetailParams } from "@/lib/dovetail";
 import type { LatchBoxShapeData } from "@/lib/latchBoxTypes";
+import type { SlidingLidBoxShapeData } from "@/lib/slidingLidBoxShapes";
 
 export type ShapeKind =
   | "box"
@@ -30,7 +33,7 @@ export type ShapeAsset = {
   hole?: boolean;
 };
 
-export type ProjectAssetSourceFormat = "stl" | "obj" | "svg" | "step";
+export type ProjectAssetSourceFormat = "stl" | "obj" | "svg" | "step" | "3mf";
 
 export type ProjectAsset = {
   id: string;
@@ -248,7 +251,7 @@ export type WorkplaneShape = {
     baseDepth: number;
     baseHeight: number;
     triangleCount: number;
-    sourceFormat: "stl" | "obj" | "svg" | "json" | "step";
+    sourceFormat: "stl" | "obj" | "svg" | "json" | "step" | "3mf";
     // IndexedDB persistence uses this only in compact stored shape records.
     // Runtime editor shapes are hydrated with the full immutable mesh resource.
     storageResourceId?: string;
@@ -265,6 +268,10 @@ export type WorkplaneShape = {
     mimeType: string;
     pixelWidth: number;
     pixelHeight: number;
+    /** Fork (see FORK.md): a translucent reference photo rather than a printable plate. */
+    reference?: boolean;
+    /** Fork: opacity of a reference image, 0.05–1 (default 0.5). */
+    opacity?: number;
   };
   sketchProfile?: SketchProfile;
   sketchOperation?: SketchOperation;
@@ -296,8 +303,20 @@ export type WorkplaneShape = {
   boxCorners?: "all" | "vertical";
   boxWall?: number;
   boxFloor?: number;
+  /**
+   * Hollow cylinder (fork feature, see FORK.md): `cylinderWall` > 0 hollows a cylinder with an
+   * open top; `cylinderFloor` is the bottom thickness (defaults to the wall, 0 = open bottom).
+   */
+  cylinderWall?: number;
+  cylinderFloor?: number;
   /** Latch & screw box generator parameters (fork feature, see FORK.md). Set on generated mesh parts. */
   latchBox?: LatchBoxShapeData;
+  /** Dovetail joint parameters (fork feature, see FORK.md). Set on generated dovetail meshes. */
+  dovetail?: DovetailParams;
+  /** Asterisk parameters (fork feature, see FORK.md). Set on generated asterisk meshes. */
+  asterisk?: AsteriskParams;
+  /** Sliding lid box generator parameters (fork feature, see FORK.md). Set on the generated body and lid. */
+  slidingLidBox?: SlidingLidBoxShapeData;
   locked?: boolean;
   hidden?: boolean;
 };

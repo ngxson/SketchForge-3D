@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  axisLockedDragDelta,
+  viewCenterOnWorkplane,
   horizontalPlacementWorkplane,
   placementPatchForNewShape,
   placementWorkplaneCoordinates,
@@ -106,5 +108,47 @@ describe("placement workplanes", () => {
     ]);
 
     expect(translation).toEqual({ x: 0, y: -5, z: 0 });
+  });
+});
+
+describe("axisLockedDragDelta", () => {
+  const base = horizontalPlacementWorkplane();
+  // -0 + 0 is +0, so the comparisons ignore the sign of zero.
+  const lock = (...args: Parameters<typeof axisLockedDragDelta>) => {
+    const { x, y, z } = axisLockedDragDelta(...args);
+    return { x: x + 0, y: y + 0, z: z + 0 };
+  };
+  it("keeps the delta unchanged without Shift", () => {
+    expect(lock({ x: 7, y: 0, z: -3 }, base, false)).toEqual({ x: 7, y: 0, z: -3 });
+  });
+
+  it("locks to the closer workplane axis", () => {
+    expect(lock({ x: 7, y: 0, z: -3 }, base, true)).toEqual({ x: 7, y: 0, z: 0 });
+    expect(lock({ x: 2, y: 0, z: -9 }, base, true)).toEqual({ x: 0, y: 0, z: -9 });
+  });
+
+  it("uses the axes of a tilted workplane", () => {
+    const wall = { origin: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 0, z: 1 }, xAxis: { x: 1, y: 0, z: 0 }, zAxis: { x: 0, y: -1, z: 0 } };
+    expect(lock({ x: 1, y: 6, z: 0 }, wall, true)).toEqual({ x: 0, y: 6, z: 0 });
+  });
+});
+
+describe("viewCenterOnWorkplane", () => {
+  const base = horizontalPlacementWorkplane();
+  const down45 = { x: 0, y: -Math.SQRT1_2, z: -Math.SQRT1_2 };
+
+  it("finds where the view centre meets the plate, snapped to the grid", () => {
+    const hit = viewCenterOnWorkplane(base, { position: { x: 30.4, y: 50, z: 80 }, forward: down45, orthographic: false }, 1);
+    expect(hit).toEqual({ x: 30, y: 0, z: 30 });
+  });
+
+  it("lets an orthographic camera see the plate behind its position", () => {
+    const view = { position: { x: 0, y: -10, z: 0 }, forward: down45, orthographic: true };
+    expect(viewCenterOnWorkplane(base, view, 5)).toEqual({ x: 0, y: 0, z: 10 });
+    expect(viewCenterOnWorkplane(base, { ...view, orthographic: false })).toBeNull();
+  });
+
+  it("gives up when the view runs along the plate", () => {
+    expect(viewCenterOnWorkplane(base, { position: { x: 0, y: 10, z: 0 }, forward: { x: 0, y: 0, z: -1 }, orthographic: false })).toBeNull();
   });
 });

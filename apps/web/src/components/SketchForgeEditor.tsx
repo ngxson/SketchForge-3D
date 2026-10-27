@@ -3,7 +3,7 @@
 import { Check, Circle as CircleIcon, CloudUpload, Download, Eye, FolderOpen, Hexagon as HexagonIcon, Square as SquareIcon, Triangle as TriangleIcon, X } from "lucide-react";
 import type manifoldModule from "manifold-3d";
 import type { ManifoldToplevel } from "manifold-3d";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ADDITION, Brush, Evaluator, HOLLOW_INTERSECTION, HOLLOW_SUBTRACTION, INTERSECTION, SUBTRACTION, type CSGOperation } from "three-bvh-csg";
 import * as THREE from "three";
 import { TextGeometry } from "three/examples/jsm/geometries/TextGeometry.js";
@@ -87,13 +87,15 @@ import { cloneWorkplaneShapeSnapshot, compactEdgeTreatmentHistory, edgeTreatment
 import { appendEditorHistorySnapshot, boundedEditorHistoryState, editorHistoryEntry, editorHistoryForExport, hydrateEditorHistoryState, projectShapesFingerprint, type EditorHistoryEntry, type EditorHistoryExportLimit, type EditorHistoryState } from "@/lib/editorHistory";
 import { snapShapeFootprintToVisibleGrid, visibleGridStep } from "@/lib/gridSnap";
 import { geometryRotationDegreesForShortcut, geometryRotationDelta, rotatedGeometryShapePatch } from "@/lib/geometryRotation";
-import { createKeyboardMovementInteraction, isMovementKey, moveShapesByKeyboard } from "@/lib/keyboardMovement";
+import { createKeyboardMovementInteraction, isMovementKey, keyboardMovementAxes, moveShapesByKeyboard, type KeyboardMovementView } from "@/lib/keyboardMovement";
 import { createLocalId } from "@/lib/localIds";
 import { projectExportFileName } from "@/lib/exportNames";
 import { exportMeshesToObj } from "@/lib/objExport";
 import { rotateSketchPoints, selectedClosedSketchPoints } from "@/lib/sketchRotation";
 import { PROJECT_THUMBNAIL_IDLE_MS, projectThumbnailSceneChanged, type ProjectThumbnailSceneKey } from "@/lib/projectThumbnail";
 import { importedShapeFromObj } from "@/lib/objImport";
+import { importedShapeFrom3mf } from "@/lib/threeMfImport";
+import { DEFAULT_REFERENCE_IMAGE_OPACITY, isReferenceImage, isReferenceImageFile, REFERENCE_IMAGE_THICKNESS, withoutReferenceImages } from "@/lib/referenceImage";
 import { attachProjectAsset, dedupeProjectAssets, projectAssetFromBytes, sourceFormatForFileName } from "@/lib/projectAssets";
 import { findSketchOutlineIntersection } from "@/lib/sketchProfileValidation";
 import { addLineIntersectionPoints, splitSketchSegment } from "@/lib/sketchPointRefinement";
@@ -107,11 +109,32 @@ import { DEFAULT_OPENSCAD_SOURCE, isOpenScadShape, openScadShapeFromStl } from "
 import { cancelOpenScadRender, openScadRuntimeAvailable, renderOpenScad } from "@/lib/openscadRuntime";
 import type { OpenScadInputFile } from "@/lib/openscadTypes";
 import { OpenScadWorkspace, type OpenScadRenderStatus } from "./OpenScadWorkspace";
-import { boxGeometryOptionsFromShape, createBoxGeometry } from "@/lib/boxGeometry";
+import { boxGeometryOptionsFromShape, boxIsPlain, createBoxGeometry } from "@/lib/boxGeometry";
+import { buildHollowCylinderGeometry, cylinderIsPlain, hollowCylinderOptionsFromShape } from "@/lib/cylinderGeometry";
 import { normalizeLatchBoxParams, validateLatchBoxParams, type LatchBoxParams } from "@/lib/latchBox";
+import { dovetailShapePatch } from "@/lib/dovetail";
+import { asteriskShapePatch } from "@/lib/asterisk";
+import { meshShapeFromWorldPositions, offsetTriangleSoup, triangleSoupVolume } from "@/lib/meshOffset";
+import { repairTJunctions } from "@/lib/meshRepair";
+import { formatBooleanProgress, getBooleanProgress, setBooleanProgress, subscribeBooleanProgress, updateBooleanProgressDetail, type BooleanProgressState } from "@/lib/booleanProgress";
+import { buildManifoldOperand, type ManifoldOperand, type ManifoldPrimitiveOperand } from "@/lib/manifoldOperands";
+import {
+  MANIFOLD_BOOLEAN_STAGE_LABELS,
+  ManifoldBooleanError,
+  canUseManifoldBooleanWorker,
+  estimateManifoldBooleanMs,
+  loadManifoldBooleanRate,
+  manifoldAssetBase,
+  saveManifoldBooleanRate,
+  subtractInManifoldWorker,
+  updateManifoldBooleanRate,
+} from "@/lib/manifoldBooleanRuntime";
+import { cavityFillPositions } from "@/lib/cavityFill";
 import { buildLatchBoxParts } from "@/lib/latchBoxRuntime";
 import { LATCH_BOX_PART_GAP, latchBoxShapeFromMesh } from "@/lib/latchBoxShapes";
-import { LATCH_BOX_ASSET_ID } from "@/lib/shapeCatalog";
+import { LATCH_BOX_ASSET_ID, SLIDING_LID_BOX_ASSET_ID } from "@/lib/shapeCatalog";
+import { buildSlidingLidBox, normalizeSlidingLidBoxParams, validateSlidingLidBoxParams, type SlidingLidBoxParams } from "@/lib/slidingLidBox";
+import { meshBounds, slidingLidBoxShapeFromMesh } from "@/lib/slidingLidBoxShapes";
 import { exportMeshesToStl } from "@/lib/stlExport";
 import { importedShapeFromSvg, invalidSvgMeshReason } from "@/lib/svgImport";
 import { toSvgProjection, type SvgProjectionLayer } from "@/lib/svgExport";
@@ -119,6 +142,7 @@ import { normalizeSnapGrid, normalizeWorkspaceSettings, workplaneSettingsFingerp
 import {
   normalizePlacementWorkplane,
   placementPatchForNewShape,
+  viewCenterOnWorkplane,
   placementWorkplaneCoordinates,
   placementWorkplaneFromSurface,
   placementWorkplaneIsBase,
@@ -195,6 +219,7 @@ type GroupBuildResult = {
   hasImportedMesh: boolean;
   consumed: boolean;
   failureNotice: string;
+  manifoldFailure: ManifoldBooleanFailure | null;
 };
 type IntersectionAttempt =
   | { status: "success"; group: WorkplaneShape }
@@ -242,6 +267,12 @@ const MIN_SHAPE_DIMENSION = 0.01;
 const MAX_SKETCH_HISTORY_ENTRIES = 100;
 const MODEL_DIMENSION_PRECISION = 3;
 const IMPORTED_EXACT_BOOLEAN_TRIANGLE_LIMIT = 150000;
+// Fork change (see FORK.md, "Cutting large imported meshes"): the limit above protects the
+// three-bvh-csg fallback. Manifold copes with far larger meshes, so its paths get their own cap.
+const MANIFOLD_BOOLEAN_TRIANGLE_LIMIT = 2_000_000;
+type ManifoldBooleanFailure = "tooLarge" | "notClosed" | "cancelled";
+// Cuts at least this big run in the boolean worker (see FORK.md, "Cutting without freezing the editor").
+const MANIFOLD_WORKER_TRIANGLE_THRESHOLD = 20_000;
 const COPLANAR_BOOLEAN_RESCUE_DEGREES = 0.02;
 const NORMAL_SELECTION_CAD_EDGE_MIN_ANGLE = 60;
 const MIN_EDGE_MODIFIER_AMOUNT = 0.001;
@@ -2180,10 +2211,16 @@ function geometryMeshForShape(shape: WorkplaneShape): MeshData | null {
     case "box":
       geometry = createBoxGeometry(boxGeometryOptionsFromShape(shape, width, depth, height));
       break;
-    case "cylinder":
+    case "cylinder": {
+      const hollow = hollowCylinderOptionsFromShape(shape, width, depth, height);
+      if (hollow) {
+        geometry = buildHollowCylinderGeometry(hollow);
+        break;
+      }
       geometry = new THREE.CylinderGeometry(1, 1, height, shape.sides ?? 96, shape.segments ?? 1);
       geometry.scale(width / 2, 1, depth / 2);
       break;
+    }
     case "sphere":
       geometry = new THREE.SphereGeometry(1, sphereTessellation(shape.steps).widthSegments, sphereTessellation(shape.steps).heightSegments);
       geometry.scale(width / 2, height / 2, depth / 2);
@@ -2568,27 +2605,31 @@ function imagePlateDimensions(pixelWidth: number, pixelHeight: number) {
   };
 }
 
-async function importedShapeFromImage(file: File): Promise<WorkplaneShape> {
-  const imagePlate = await prepareImportedImage(file);
-  const dimensions = imagePlateDimensions(imagePlate.pixelWidth, imagePlate.pixelHeight);
+/**
+ * Reference image (fork feature, see FORK.md): a thin image-plate box marked `reference`, shown
+ * as a translucent photo on the workplane. The caller places it.
+ */
+async function referenceImageShapeFromFile(file: File): Promise<WorkplaneShape> {
+  const prepared = await prepareImportedImage(file);
+  const dimensions = imagePlateDimensions(prepared.pixelWidth, prepared.pixelHeight);
   return {
-    id: createLocalId("uploaded-image"),
-    name: file.name.replace(/\.[^.]+$/, "") || "Imported Image",
+    id: createLocalId("reference-image"),
+    name: file.name.replace(/\.[^.]+$/, "") || "Reference image",
     kind: "box",
     color: "#f4f7f9",
-    x: 10,
-    z: -10,
+    x: 0,
+    z: 0,
     size: Math.max(dimensions.width, dimensions.depth),
     width: dimensions.width,
     depth: dimensions.depth,
-    height: dimensions.height,
+    height: REFERENCE_IMAGE_THICKNESS,
     elevation: 0,
     rotation: 0,
     rotationX: 0,
     rotationZ: 0,
     radius: 0,
     steps: 1,
-    imagePlate,
+    imagePlate: { ...prepared, reference: true, opacity: DEFAULT_REFERENCE_IMAGE_OPACITY },
     locked: false,
     hidden: false,
   };
@@ -3508,7 +3549,8 @@ function isAxisAlignedBoxCutter(shape: WorkplaneShape) {
   const straightY = rotation < 0.001 || Math.abs(rotation - 180) < 0.001 || Math.abs(rotation - 360) < 0.001;
   const straightX = rotationX < 0.001 || Math.abs(rotationX - 180) < 0.001 || Math.abs(rotationX - 360) < 0.001;
   const straightZ = rotationZ < 0.001 || Math.abs(rotationZ - 180) < 0.001 || Math.abs(rotationZ - 360) < 0.001;
-  return shape.kind === "box" && straightX && straightY && straightZ;
+  // Rounded or hollow boxes are not cuboids; the cuboid fast paths would drop their shape.
+  return boxIsPlain(shape) && straightX && straightY && straightZ;
 }
 
 type ClipPlane = { axis: 0 | 1 | 2; value: number; keepGreater: boolean };
@@ -4080,31 +4122,6 @@ function mergedSolidMeshData(solids: WorkplaneShape[]) {
   return mergedSolidMesh;
 }
 
-function meshDataToManifoldMesh(runtime: ManifoldToplevel, mesh: MeshData) {
-  const vertProperties = new Float32Array(mesh.vertices.length * 3);
-  mesh.vertices.forEach(([x, y, z], index) => {
-    vertProperties[index * 3] = x;
-    vertProperties[index * 3 + 1] = y;
-    vertProperties[index * 3 + 2] = z;
-  });
-
-  const triVerts = new Uint32Array(mesh.faces.length * 3);
-  mesh.faces.forEach(([a, b, c], index) => {
-    triVerts[index * 3] = a;
-    triVerts[index * 3 + 1] = b;
-    triVerts[index * 3 + 2] = c;
-  });
-
-  const manifoldMesh = new runtime.Mesh({
-    numProp: 3,
-    vertProperties,
-    triVerts,
-    tolerance: 0.0001,
-  });
-  manifoldMesh.merge();
-  return manifoldMesh;
-}
-
 function boxBoundsToManifold(runtime: ManifoldToplevel, bounds: Cuboid, created: ManifoldSolid[]) {
   const width = bounds.maxX - bounds.minX;
   const height = bounds.maxY - bounds.minY;
@@ -4159,7 +4176,10 @@ function transformedPrimitiveManifold(runtime: ManifoldToplevel, primitive: Mani
   return trackManifold(created, primitive.transform(manifoldTransformFromMatrix(matrix)));
 }
 
-function primitiveManifoldForShape(runtime: ManifoldToplevel, shape: WorkplaneShape, created: ManifoldSolid[]) {
+// Fork change (see FORK.md, "Cutting without freezing the editor"): operands are described first
+// (analytic primitive with its matrix, box bounds, or a triangle soup) so the same description can
+// be built on the main thread or posted to the boolean worker.
+function primitiveOperandForShape(shape: WorkplaneShape): ManifoldPrimitiveOperand | null {
   const width = shapeWidth(shape);
   const depth = shapeDepth(shape);
   const height = shape.height;
@@ -4167,21 +4187,17 @@ function primitiveManifoldForShape(runtime: ManifoldToplevel, shape: WorkplaneSh
     return null;
   }
 
-  if (shape.kind === "box") {
-    return transformedPrimitiveManifold(runtime, runtime.Manifold.cube(1, true), primitiveTransformMatrix(shape, new THREE.Vector3(width, height, depth)), created);
+  if (boxIsPlain(shape)) {
+    return { kind: "cube", matrix: Array.from(primitiveTransformMatrix(shape, new THREE.Vector3(width, height, depth)).elements) };
   }
 
   if (shape.kind === "sphere") {
     const { widthSegments } = sphereTessellation(shape.steps);
-    return transformedPrimitiveManifold(
-      runtime,
-      runtime.Manifold.sphere(1, widthSegments),
-      primitiveTransformMatrix(shape, new THREE.Vector3(width / 2, height / 2, depth / 2)),
-      created,
-    );
+    return { kind: "sphere", segments: widthSegments, matrix: Array.from(primitiveTransformMatrix(shape, new THREE.Vector3(width / 2, height / 2, depth / 2)).elements) };
   }
 
-  if (shape.kind === "cylinder" || shape.kind === "cone") {
+  // A hollow cylinder (fork feature) has no Manifold primitive; it goes through its mesh.
+  if ((shape.kind === "cylinder" && cylinderIsPlain(shape)) || shape.kind === "cone") {
     const sides = shape.sides ?? 96;
     const topRadiusScale =
       shape.kind === "cone"
@@ -4189,33 +4205,45 @@ function primitiveManifoldForShape(runtime: ManifoldToplevel, shape: WorkplaneSh
           ? (shape.topRadius ?? 0) / shape.baseRadius
           : 0
         : 1;
-    return transformedPrimitiveManifold(
-      runtime,
-      runtime.Manifold.cylinder(1, 1, topRadiusScale, sides, true),
-      primitiveTransformMatrix(shape, new THREE.Vector3(width / 2, depth / 2, height), new THREE.Euler(-Math.PI / 2, 0, 0, "XYZ")),
-      created,
-    );
+    return {
+      kind: "cylinder",
+      segments: sides,
+      topRadiusScale,
+      matrix: Array.from(primitiveTransformMatrix(shape, new THREE.Vector3(width / 2, depth / 2, height), new THREE.Euler(-Math.PI / 2, 0, 0, "XYZ")).elements),
+    };
   }
 
   return null;
 }
 
-function shapeToManifoldSolid(runtime: ManifoldToplevel, shape: WorkplaneShape, created: ManifoldSolid[], useBoxPrimitive = false) {
+function meshDataToPositions(mesh: MeshData) {
+  const positions = new Float32Array(mesh.faces.length * 9);
+  mesh.faces.forEach(([a, b, c], index) => {
+    positions.set(mesh.vertices[a], index * 9);
+    positions.set(mesh.vertices[b], index * 9 + 3);
+    positions.set(mesh.vertices[c], index * 9 + 6);
+  });
+  return positions;
+}
+
+function manifoldOperandForShape(shape: WorkplaneShape, useBoxPrimitive = false): ManifoldOperand {
+  const primitive = primitiveOperandForShape(shape);
   if (useBoxPrimitive && isAxisAlignedBoxCutter(shape)) {
-    return primitiveManifoldForShape(runtime, shape, created) ?? boxBoundsToManifold(runtime, meshAabb(shape), created);
+    if (primitive) return primitive;
+    const bounds = meshAabb(shape);
+    return {
+      kind: "bounds",
+      min: [bounds.minX, bounds.minY, bounds.minZ],
+      size: [bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, bounds.maxZ - bounds.minZ],
+    };
   }
+  // A mesh that Manifold rejects as non-manifold is retried after T-junction repair inside
+  // buildManifoldOperand (lib/manifoldOperands.ts), the way Fill Hollow already does.
+  return primitive ?? { kind: "mesh", positions: meshDataToPositions(meshForShape(shape)) };
+}
 
-  const primitive = primitiveManifoldForShape(runtime, shape, created);
-  if (primitive) {
-    return primitive;
-  }
-
-  const mesh = meshDataToManifoldMesh(runtime, meshForShape(shape));
-  try {
-    return runtime.Manifold.ofMesh(mesh);
-  } finally {
-    disposeManifold(mesh);
-  }
+function shapeToManifoldSolid(runtime: ManifoldToplevel, shape: WorkplaneShape, created: ManifoldSolid[], useBoxPrimitive = false) {
+  return trackManifold(created, buildManifoldOperand(runtime, manifoldOperandForShape(shape, useBoxPrimitive)));
 }
 
 function shapesToManifoldUnion(runtime: ManifoldToplevel, shapes: WorkplaneShape[], created: ManifoldSolid[], useBoxPrimitive = false) {
@@ -4345,7 +4373,10 @@ function disposeManifold(value: unknown) {
   (value as { delete?: () => void } | null)?.delete?.();
 }
 
-async function manifoldBooleanMeshShape(selection: WorkplaneShape[], options: { requireImported?: boolean; idPrefix?: string } = {}): Promise<WorkplaneShape | null> {
+async function manifoldBooleanMeshShape(
+  selection: WorkplaneShape[],
+  options: { requireImported?: boolean; idPrefix?: string; diagnostics?: { failure: ManifoldBooleanFailure | null } } = {},
+): Promise<WorkplaneShape | null> {
   // GROUPING SAFETY NOTE FOR FUTURE AGENTS:
   // Imported STL + hole grouping stays on exact boolean first. Rotated cutters
   // are validated against their real oriented volume, not their broad AABB.
@@ -4355,9 +4386,49 @@ async function manifoldBooleanMeshShape(selection: WorkplaneShape[], options: { 
     return null;
   }
 
+  // Fork change (see FORK.md, "Cutting without freezing the editor"): for a big cut, show the progress
+  // dialog before the synchronous mesh preparation below and let it paint; Cancel works from here on.
+  const cancelController = new AbortController();
+  const approximateTriangles = selection.reduce((total, shape) => total + (shape.importedMesh?.triangleCount ?? 0), 0);
+  if (canUseManifoldBooleanWorker() && approximateTriangles >= MANIFOLD_WORKER_TRIANGLE_THRESHOLD) {
+    setBooleanProgress({
+      label: "Cutting imported mesh",
+      detail: "Preparing the mesh…",
+      startedAt: performance.now(),
+      estimatedMs: estimateManifoldBooleanMs(approximateTriangles, loadManifoldBooleanRate()),
+      triangles: approximateTriangles,
+      cancel: () => cancelController.abort(),
+    });
+    await yieldToPaint();
+  }
+  try {
+    return await manifoldBooleanMeshShapeBody(selection, solids, holes, options, cancelController);
+  } finally {
+    setBooleanProgress(null);
+  }
+}
+
+function yieldToPaint() {
+  return new Promise<void>((resolve) => {
+    if (typeof requestAnimationFrame !== "function") {
+      resolve();
+      return;
+    }
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
+}
+
+async function manifoldBooleanMeshShapeBody(
+  selection: WorkplaneShape[],
+  solids: WorkplaneShape[],
+  holes: WorkplaneShape[],
+  options: { requireImported?: boolean; idPrefix?: string; diagnostics?: { failure: ManifoldBooleanFailure | null } },
+  cancelController: AbortController,
+): Promise<WorkplaneShape | null> {
   const sourceMesh = mergedSolidMeshData(solids);
   const cutterTriangleCount = holes.reduce((total, hole) => total + meshForShape(hole).faces.length, 0);
-  if (sourceMesh.faces.length + cutterTriangleCount > IMPORTED_EXACT_BOOLEAN_TRIANGLE_LIMIT) {
+  if (sourceMesh.faces.length + cutterTriangleCount > MANIFOLD_BOOLEAN_TRIANGLE_LIMIT) {
+    if (options.diagnostics) options.diagnostics.failure = "tooLarge";
     return null;
   }
   const cutterShapes = holes.map(paddedCutterShape);
@@ -4366,32 +4437,20 @@ async function manifoldBooleanMeshShape(selection: WorkplaneShape[], options: { 
   const sourceTouchedTriangles = cutterTouchedTriangleCount(sourceMesh, cutterShapes);
   const sourceCutTriangles = Math.max(sourceInteriorTriangles, sourceTouchedTriangles);
 
-  const created: ManifoldSolid[] = [];
-  let result: ManifoldSolid | null = null;
+  const positions = await manifoldSubtractPositions(solids, cutterShapes, sourceMesh.faces.length + cutterTriangleCount, cancelController, options.diagnostics);
+  if (!positions) {
+    return null;
+  }
 
   try {
-    const runtime = await getManifoldRuntime();
-    const solid = shapesToManifoldUnion(runtime, solids, created, true);
-    const cutterSolid = shapesToManifoldUnion(runtime, holes.map(paddedCutterShape), created, true);
-    if (!solid || !cutterSolid) {
-      return null;
-    }
-
-    result = solid.subtract(cutterSolid);
-    created.push(result);
-    if (result.status() !== "NoError" || result.numTri() < 1) {
-      return null;
-    }
-
-    const outputMesh = result.getMesh();
-    const positions = manifoldMeshToPositions(outputMesh);
+    updateBooleanProgressDetail("Building the shape…");
     const resultChanged = positionsDifferFromMeshData(positions, sourceMesh);
     if (!resultChanged) {
       return null;
     }
     const hasImportedOperand = selection.some((shape) => Boolean(shape.importedMesh));
     const canUseResidualInteriorValidation =
-      !hasImportedOperand && holes.every((hole) => hole.kind === "box" && !hole.importedMesh && !hole.groupedShapes?.length);
+      !hasImportedOperand && holes.every((hole) => boxIsPlain(hole) && !hole.importedMesh && !hole.groupedShapes?.length);
     if (canUseResidualInteriorValidation) {
       const remainingInteriorTriangles = positionsInteriorTriangleCount(positions, residualValidationShapes, true);
       if (sourceCutTriangles > 0 && remainingInteriorTriangles > Math.max(12, Math.floor(sourceCutTriangles * 0.35))) {
@@ -4408,6 +4467,73 @@ async function manifoldBooleanMeshShape(selection: WorkplaneShape[], options: { 
     return group;
   } catch {
     return null;
+  }
+}
+
+// Fork change (see FORK.md, "Cutting without freezing the editor"): big cuts run in a worker with a
+// progress dialog (ETA from the calibrated rate, Cancel terminates the worker); small ones stay on
+// the main thread, where the worker round trip would cost more than the boolean.
+async function manifoldSubtractPositions(
+  solids: WorkplaneShape[],
+  cutters: WorkplaneShape[],
+  totalTriangles: number,
+  controller: AbortController,
+  diagnostics?: { failure: ManifoldBooleanFailure | null },
+): Promise<number[] | null> {
+  if (controller.signal.aborted) {
+    if (diagnostics) diagnostics.failure = "cancelled";
+    return null;
+  }
+  if (canUseManifoldBooleanWorker() && totalTriangles >= MANIFOLD_WORKER_TRIANGLE_THRESHOLD) {
+    const rate = loadManifoldBooleanRate();
+    setBooleanProgress({
+      label: "Cutting imported mesh",
+      detail: "Preparing the mesh…",
+      startedAt: getBooleanProgress()?.startedAt ?? performance.now(),
+      estimatedMs: estimateManifoldBooleanMs(totalTriangles, rate),
+      triangles: totalTriangles,
+      cancel: () => controller.abort(),
+    });
+    try {
+      const result = await subtractInManifoldWorker(
+        {
+          assetBase: manifoldAssetBase(),
+          solids: solids.map((shape) => manifoldOperandForShape(shape, true)),
+          cutters: cutters.map((shape) => manifoldOperandForShape(shape, true)),
+        },
+        { signal: controller.signal, onProgress: (stage) => updateBooleanProgressDetail(MANIFOLD_BOOLEAN_STAGE_LABELS[stage]) },
+      );
+      saveManifoldBooleanRate(updateManifoldBooleanRate(totalTriangles, result.durationMs, rate));
+      return Array.from(result.positions);
+    } catch (error) {
+      if (diagnostics) {
+        diagnostics.failure = controller.signal.aborted
+          ? "cancelled"
+          : error instanceof ManifoldBooleanError && error.reason === "notClosed"
+            ? "notClosed"
+            : null;
+      }
+      return null;
+    }
+  }
+
+  const created: ManifoldSolid[] = [];
+  try {
+    const runtime = await getManifoldRuntime();
+    const solid = shapesToManifoldUnion(runtime, solids, created, true);
+    const cutterSolid = shapesToManifoldUnion(runtime, cutters, created, true);
+    if (!solid || !cutterSolid) {
+      if (diagnostics) diagnostics.failure = "notClosed";
+      return null;
+    }
+    const result = solid.subtract(cutterSolid);
+    created.push(result);
+    if (result.status() !== "NoError" || result.numTri() < 1) {
+      return null;
+    }
+    return manifoldMeshToPositions(result.getMesh());
+  } catch {
+    return null;
   } finally {
     Array.from(new Set(created)).forEach(disposeManifold);
   }
@@ -4420,7 +4546,7 @@ async function manifoldUnionMeshShape(selection: WorkplaneShape[]): Promise<Work
   }
 
   const mergedSourceMesh = mergedSolidMeshData(solids);
-  if (mergedSourceMesh.faces.length > IMPORTED_EXACT_BOOLEAN_TRIANGLE_LIMIT) {
+  if (mergedSourceMesh.faces.length > MANIFOLD_BOOLEAN_TRIANGLE_LIMIT) {
     return null;
   }
 
@@ -4463,7 +4589,7 @@ async function manifoldIntersectionMeshShape(selection: WorkplaneShape[]): Promi
   }
 
   const sourceTriangleCount = selection.reduce((total, shape) => total + meshForShape(shape).faces.length, 0);
-  if (sourceTriangleCount > IMPORTED_EXACT_BOOLEAN_TRIANGLE_LIMIT) {
+  if (sourceTriangleCount > MANIFOLD_BOOLEAN_TRIANGLE_LIMIT) {
     return { status: "unsupported" };
   }
 
@@ -4688,8 +4814,8 @@ function importedBooleanMeshShape(selection: WorkplaneShape[]): WorkplaneShape |
 }
 
 function boxedBooleanMeshShape(selection: WorkplaneShape[]): WorkplaneShape | null {
-  const solids = selection.filter((shape) => !shape.hole && shape.kind === "box" && !shape.locked);
-  const holes = selection.filter((shape) => shape.hole && shape.kind === "box");
+  const solids = selection.filter((shape) => !shape.hole && boxIsPlain(shape) && !shape.locked);
+  const holes = selection.filter((shape) => shape.hole && boxIsPlain(shape));
   if (solids.length === 0 || holes.length === 0) {
     return null;
   }
@@ -5201,7 +5327,8 @@ async function buildGroupedShapeFromSelection(groupable: WorkplaneShape[]): Prom
   const hasImportedMesh = booleanSelection.some((shape) => Boolean(shape.importedMesh));
   const boxBooleanSelection = hasSolid && hasHole ? expandGroupsForBoxBoolean(groupable) : [];
   const cleanBoxGroup = canUseBoxBoolean(boxBooleanSelection) ? boxedBooleanMeshShape(boxBooleanSelection) : null;
-  const manifoldCutGroup = hasSolid && hasHole ? await manifoldBooleanMeshShape(booleanSelection, { requireImported: false }) : null;
+  const manifoldDiagnostics: { failure: ManifoldBooleanFailure | null } = { failure: null };
+  const manifoldCutGroup = hasSolid && hasHole ? await manifoldBooleanMeshShape(booleanSelection, { requireImported: false, diagnostics: manifoldDiagnostics }) : null;
   const manifoldImportedMerge = hasImportedMesh && hasSolid && !hasHole ? await manifoldUnionMeshShape(booleanSelection) : null;
   const exactImportedGroup = hasImportedMesh && hasSolid && hasHole ? manifoldCutGroup ?? importedBooleanMeshShape(booleanSelection) : null;
   const bakedImportedMerge = hasImportedMesh && !(hasSolid && hasHole) ? manifoldImportedMerge ?? mergedMeshShape(booleanSelection) : null;
@@ -5215,6 +5342,15 @@ async function buildGroupedShapeFromSelection(groupable: WorkplaneShape[]): Prom
       ? bakedImportedMerge ?? groupedShape(groupable)
       : groupedShape(groupable);
   const consumed = !group && hasSolid && hasHole && cutFullyConsumesSolids(booleanSelection);
+  const importedTriangles = booleanSelection.reduce((total, shape) => total + (shape.importedMesh?.triangleCount ?? 0), 0);
+  // Fork change (see FORK.md, "Cutting large imported meshes"): say why the cut failed.
+  const importedCutNotice = manifoldDiagnostics.failure === "cancelled"
+    ? "Cut cancelled"
+    : manifoldDiagnostics.failure === "tooLarge"
+    ? `Could not cut this imported mesh: ${importedTriangles.toLocaleString()} triangles is over the ${MANIFOLD_BOOLEAN_TRIANGLE_LIMIT.toLocaleString()} limit. Simplify it before importing`
+    : manifoldDiagnostics.failure === "notClosed"
+      ? "Could not cut this imported mesh: it is not a closed (watertight) solid. Repair it in a mesh tool and import it again"
+      : "Could not cut this imported mesh cleanly";
   return {
     group,
     booleanSelection,
@@ -5222,8 +5358,40 @@ async function buildGroupedShapeFromSelection(groupable: WorkplaneShape[]): Prom
     hasHole,
     hasImportedMesh,
     consumed,
-    failureNotice: hasImportedMesh && hasSolid && hasHole ? "Could not cut this imported mesh cleanly" : hasSolid && hasHole ? "Could not cut this selection" : "Could not group this selection",
+    manifoldFailure: manifoldDiagnostics.failure,
+    failureNotice: hasImportedMesh && hasSolid && hasHole ? importedCutNotice : hasSolid && hasHole ? "Could not cut this selection" : "Could not group this selection",
   };
+}
+
+// Fork (see FORK.md, "Cutting without freezing the editor"): shown while a cut runs in the worker.
+// Ticks every 500 ms; the ETA comes from the triangle count and the rate measured on earlier cuts.
+function BooleanProgressDialog({ progress }: { progress: BooleanProgressState }) {
+  const [now, setNow] = useState(() => performance.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(performance.now()), 500);
+    return () => window.clearInterval(timer);
+  }, []);
+  const readout = formatBooleanProgress(now - progress.startedAt, progress.estimatedMs);
+  return (
+    <div className="boolean-progress-overlay" role="dialog" aria-modal="true" aria-label={progress.label}>
+      <div className="boolean-progress-dialog" data-codex-boolean-progress>
+        <strong>{progress.label}</strong>
+        <p>
+          {progress.detail} <span>{progress.triangles.toLocaleString()} triangles</span>
+        </p>
+        <div className="boolean-progress-bar" aria-hidden="true">
+          <span style={{ width: `${readout.percent}%` }} />
+        </div>
+        <div className="boolean-progress-meta" aria-live="polite">
+          <span>{readout.eta}</span>
+          <span>{readout.elapsed}</span>
+        </div>
+        <div className="boolean-progress-actions">
+          <button type="button" onClick={progress.cancel}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function debugShapeSummary(shape: WorkplaneShape): Record<string, unknown> {
@@ -5386,6 +5554,27 @@ function readMcpEditorIdentity() {
   return identity;
 }
 
+/** Grid snap step in mm for a snap setting (0 = off), as used by the viewport. */
+function snapStepForGrid(size: GridSize) {
+  if (size === "Off") return 0;
+  if (size === "Brick") return 8;
+  return Number.parseFloat(size) || 1;
+}
+
+/** Gap in mm between pasted shapes and the shapes they were copied from. */
+const PASTE_GAP = 5;
+
+/** Screen axes of the viewport camera, so arrow keys move relative to the current view. */
+function keyboardMovementView(camera: THREE.Camera | null | undefined): KeyboardMovementView | null {
+  if (!camera) return null;
+  camera.updateMatrixWorld();
+  const right = new THREE.Vector3();
+  const up = new THREE.Vector3();
+  const back = new THREE.Vector3();
+  camera.matrixWorld.extractBasis(right, up, back);
+  return { right, up, forward: back.negate() };
+}
+
 export function SketchForgeEditor({
   initialAssets = [],
   initialShapes = [],
@@ -5479,9 +5668,12 @@ export function SketchForgeEditor({
     );
   }
   const [shapes, setShapes] = useState<WorkplaneShape[]>(() => initialSceneRef.current as WorkplaneShape[]);
+  const booleanProgress = useSyncExternalStore(subscribeBooleanProgress, getBooleanProgress, () => null);
   const [projectAssets, setProjectAssets] = useState<ProjectAsset[]>(() => dedupeProjectAssets(initialAssets));
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [clipboard, setClipboard] = useState<WorkplaneShape[]>([]);
+  // Repeated pastes of the same clipboard step further right instead of stacking up.
+  const pasteRunRef = useRef<{ key: string; count: number } | null>(null);
   const [systemClipboardSupported, setSystemClipboardSupported] = useState(false);
   const [history, setHistory] = useState<EditorHistoryEntry[]>(() => (initialHistoryStateRef.current as EditorHistoryState).entries);
   const [historyIndex, setHistoryIndex] = useState(() => (initialHistoryStateRef.current as EditorHistoryState).index);
@@ -5523,6 +5715,7 @@ export function SketchForgeEditor({
   const snapGridRef = useRef(snapGrid);
   const placementElevationRef = useRef(placementElevation);
   const placementWorkplaneRef = useRef(placementWorkplane);
+  const viewportCameraRef = useRef<(() => THREE.Camera | null) | null>(null);
   const noticeRef = useRef(notice);
   const projectInfoRef = useRef({ projectId: projectId ?? null, projectName, projectCreatedAt });
   const historyIndexRef = useRef(historyIndex);
@@ -5554,6 +5747,8 @@ export function SketchForgeEditor({
   const sketchRevolveUpdateTimerRef = useRef(new Map<string, number>());
   const latchBoxUpdateRequestRef = useRef(new Map<string, number>());
   const latchBoxUpdateTimerRef = useRef(new Map<string, number>());
+  const slidingLidBoxUpdateRequestRef = useRef(new Map<string, number>());
+  const slidingLidBoxUpdateTimerRef = useRef(new Map<string, number>());
   const [sketchTool, setSketchTool] = useState<SketchTool>("line");
   const [sketchProfile, setSketchProfile] = useState<SketchProfile>(() => emptySketchProfile());
   const [sketchHistory, setSketchHistory] = useState<SketchProfile[]>([emptySketchProfile()]);
@@ -5915,8 +6110,11 @@ export function SketchForgeEditor({
   const edgeModifierMaxAmount = useMemo(() => {
     const source = cadModifierBaseShapeRef.current ?? selectedShape;
     if (!source) return 10;
-    const smallestDimension = Math.min(shapeWidth(source), shapeDepth(source), source.height);
-    return Math.max(MIN_EDGE_MODIFIER_AMOUNT, smallestDimension * 0.99);
+    // Fork change (see FORK.md, "Larger fillet and chamfer sizes"): the slider goes up to the largest
+    // dimension, not the smallest, so e.g. the vertical edges of a thin plate can take a wide radius.
+    // The CAD kernel still rejects a size that does not fit the chosen edges.
+    const largestDimension = Math.max(shapeWidth(source), shapeDepth(source), source.height);
+    return Math.max(MIN_EDGE_MODIFIER_AMOUNT, largestDimension * 0.99);
   }, [edgeModifier, selectedShape]);
   const selectedEdgeFeatureCount = useMemo(() => selectedShape ? edgeTreatmentFeatureCount(selectedShape) : 0, [selectedShape]);
   const selectedReversibleEdgeFeatureCount = useMemo(() => selectedShape ? reversibleEdgeTreatmentCount(selectedShape) : 0, [selectedShape]);
@@ -6225,7 +6423,14 @@ export function SketchForgeEditor({
       return true;
     },
     move: (event) => {
-      const next = moveShapesByKeyboard(shapesRef.current, selectedIdsRef.current, event, placementWorkplaneRef.current);
+      const next = moveShapesByKeyboard(
+        shapesRef.current,
+        selectedIdsRef.current,
+        event,
+        placementWorkplaneRef.current,
+        keyboardMovementView(viewportCameraRef.current?.()),
+        snapStepForGrid(snapGridRef.current),
+      );
       if (next === shapesRef.current) return;
       interactionHistoryChangedRef.current = true;
       shapesRef.current = next;
@@ -7147,6 +7352,19 @@ export function SketchForgeEditor({
 
   // ---- Latch & screw box generator (fork feature, see FORK.md) ----
 
+  // Fork change (see FORK.md): shapes added from the menu (no drop point) appear where the
+  // centre of the view meets the workplane, instead of at the workplane origin.
+  const newShapeBasePoint = useCallback((): PlacementPoint => {
+    const workplane = placementWorkplaneRef.current;
+    const camera = viewportCameraRef.current?.();
+    if (!camera) return workplane.origin;
+    camera.updateMatrixWorld();
+    const position = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
+    const forward = camera.getWorldDirection(new THREE.Vector3());
+    const orthographic = camera instanceof THREE.OrthographicCamera;
+    return viewCenterOnWorkplane(workplane, { position, forward, orthographic }, snapStepForGrid(snapGridRef.current)) ?? workplane.origin;
+  }, []);
+
   const addLatchBox = useCallback(async (point?: PlacementPoint) => {
     const params = normalizeLatchBoxParams(null);
     const setId = createLocalId("latch-box-set");
@@ -7156,7 +7374,7 @@ export function SketchForgeEditor({
       const { body, cover, durationMs } = await buildLatchBoxParts(params);
       if (projectInfoRef.current.projectId !== sourceProjectId) return;
       const workplane = placementWorkplaneRef.current;
-      const origin = point ?? workplane.origin;
+      const origin = point ?? newShapeBasePoint();
       const offset = params.W / 2 + LATCH_BOX_PART_GAP;
       const placed = [
         latchBoxShapeFromMesh("body", body, { setId, params }),
@@ -7170,7 +7388,7 @@ export function SketchForgeEditor({
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Could not build the latch box");
     }
-  }, [commitShapes]);
+  }, [commitShapes, newShapeBasePoint]);
 
   const scheduleLatchBoxUpdate = useCallback((setId: string, params: LatchBoxParams) => {
     // Show the new parameters immediately (no history entry); the geometry follows after a debounce.
@@ -7212,20 +7430,96 @@ export function SketchForgeEditor({
     latchBoxUpdateTimerRef.current.set(setId, timer);
   }, [commitShapes]);
 
+  // Fork feature (see FORK.md): sliding lid box. Body and lid are built together with Manifold
+  // and keep the original's layout (lid in front of the box, both on the bed).
+  const addSlidingLidBox = useCallback(async (point?: PlacementPoint) => {
+    const params = normalizeSlidingLidBoxParams(null);
+    const setId = createLocalId("sliding-lid-box-set");
+    const sourceProjectId = projectInfoRef.current.projectId;
+    setNotice("Building sliding lid box…");
+    try {
+      const runtime = await getManifoldRuntime();
+      const { body, lid, durationMs } = buildSlidingLidBox(runtime, params);
+      if (projectInfoRef.current.projectId !== sourceProjectId) return;
+      const workplane = placementWorkplaneRef.current;
+      const origin = point ?? newShapeBasePoint();
+      const all = meshBounds([...body.positions, ...lid.positions]);
+      const placed = ([["body", body], ["lid", lid]] as const).map(([part, mesh]) => {
+        const shape = slidingLidBoxShapeFromMesh(part, mesh, { setId, params });
+        const own = meshBounds(mesh.positions);
+        const patch = placementPatchForNewShape(shape, workplane, origin);
+        return canonicalizeShape({
+          ...shape,
+          ...patch,
+          x: patch.x + (own.min[0] + own.max[0]) / 2 - (all.min[0] + all.max[0]) / 2,
+          z: patch.z + (own.min[2] + own.max[2]) / 2 - (all.min[2] + all.max[2]) / 2,
+        });
+      });
+      // Select only the body so the inspector shows the generator parameters right away.
+      commitShapes([...shapesRef.current, ...placed], placed[0].id, `Sliding lid box added (${Math.round(durationMs)} ms)`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not build the sliding lid box");
+    }
+  }, [commitShapes, newShapeBasePoint]);
+
+  const scheduleSlidingLidBoxUpdate = useCallback((setId: string, params: SlidingLidBoxParams) => {
+    // Show the new parameters immediately (no history entry); the geometry follows after a debounce.
+    const withParams = shapesRef.current.map((shape) =>
+      shape.slidingLidBox?.setId === setId ? { ...shape, slidingLidBox: { ...shape.slidingLidBox, params } } : shape,
+    );
+    shapesRef.current = withParams;
+    setShapes(withParams);
+    const errors = validateSlidingLidBoxParams(params);
+    if (errors.length) {
+      setNotice(errors[0]);
+      return;
+    }
+    const previousTimer = slidingLidBoxUpdateTimerRef.current.get(setId);
+    if (previousTimer !== undefined) window.clearTimeout(previousTimer);
+    const requestId = (slidingLidBoxUpdateRequestRef.current.get(setId) ?? 0) + 1;
+    slidingLidBoxUpdateRequestRef.current.set(setId, requestId);
+    const timer = window.setTimeout(() => {
+      slidingLidBoxUpdateTimerRef.current.delete(setId);
+      void getManifoldRuntime()
+        .then((runtime) => {
+          if (slidingLidBoxUpdateRequestRef.current.get(setId) !== requestId) return;
+          const { body, lid, durationMs } = buildSlidingLidBox(runtime, params);
+          let changed = false;
+          const next = shapesRef.current.map((shape) => {
+            if (shape.slidingLidBox?.setId !== setId) return shape;
+            changed = true;
+            const mesh = shape.slidingLidBox.part === "body" ? body : lid;
+            return canonicalizeShape(slidingLidBoxShapeFromMesh(shape.slidingLidBox.part, mesh, { setId, params }, { existing: shape }));
+          });
+          if (changed) commitShapes(next, selectedIdsRef.current, `Sliding lid box updated (${Math.round(durationMs)} ms)`);
+        })
+        .catch((error) => {
+          if (slidingLidBoxUpdateRequestRef.current.get(setId) === requestId) {
+            setNotice(error instanceof Error ? error.message : "The sliding lid box could not be rebuilt");
+          }
+        });
+    }, 150);
+    slidingLidBoxUpdateTimerRef.current.set(setId, timer);
+  }, [commitShapes]);
+
   const addShape = useCallback(
     (asset: ShapeAsset, point?: PlacementPoint) => {
       if (asset.id === LATCH_BOX_ASSET_ID) {
         void addLatchBox(point);
         return;
       }
+      if (asset.id === SLIDING_LID_BOX_ASSET_ID) {
+        void addSlidingLidBox(point);
+        return;
+      }
       const shape = makeShapeFromAsset(asset, undefined, workspaceSettingsRef.current.shapeCustomizations[asset.kind]);
       const nextShape = {
         ...shape,
-        ...placementPatchForNewShape(shape, placementWorkplane, point ?? placementWorkplane.origin),
+        ...placementPatchForNewShape(shape, placementWorkplane, point ?? newShapeBasePoint()),
       };
       commitShapes([...shapes, nextShape], nextShape.id, `${asset.name} added`);
     },
-    [addLatchBox, commitShapes, placementWorkplane, shapes],
+    [addLatchBox, addSlidingLidBox, commitShapes, newShapeBasePoint, placementWorkplane, shapes],
   );
 
   const scheduleRevolveShapeUpdate = useCallback((id: string, settings: SketchRevolveSettings) => {
@@ -7286,7 +7580,15 @@ export function SketchForgeEditor({
   const updateShape = useCallback(
     (id: string, patch: ShapeUpdatePatch) => {
       const bakeTransform = Boolean(patch.bakeTransform);
-      const cleanedPatch = cleanShapePatch(patch);
+      let cleanedPatch = cleanShapePatch(patch);
+      if (cleanedPatch.dovetail) {
+        // Dovetail parameters rebuild the mesh and its size right away (cheap, synchronous).
+        cleanedPatch = { ...cleanedPatch, ...dovetailShapePatch(cleanedPatch.dovetail) };
+      }
+      if (cleanedPatch.asterisk) {
+        // Asterisk parameters (fork) rebuild the mesh and its size the same way.
+        cleanedPatch = { ...cleanedPatch, ...asteriskShapePatch(cleanedPatch.asterisk) };
+      }
       if (cleanedPatch.sketchRevolve) {
         const source = shapesRef.current.find((shape) => shape.id === id);
         if (source?.sketchOperation === "revolve" && source.sketchProfile) {
@@ -7298,6 +7600,13 @@ export function SketchForgeEditor({
         const source = shapesRef.current.find((shape) => shape.id === id);
         if (source?.latchBox) {
           scheduleLatchBoxUpdate(source.latchBox.setId, normalizeLatchBoxParams(cleanedPatch.latchBox.params));
+          return;
+        }
+      }
+      if (cleanedPatch.slidingLidBox) {
+        const source = shapesRef.current.find((shape) => shape.id === id);
+        if (source?.slidingLidBox) {
+          scheduleSlidingLidBoxUpdate(source.slidingLidBox.setId, normalizeSlidingLidBoxParams(cleanedPatch.slidingLidBox.params));
           return;
         }
       }
@@ -7338,7 +7647,7 @@ export function SketchForgeEditor({
         commitShapes(next, selectedIds);
       }
     },
-    [commitShapes, scheduleLatchBoxUpdate, scheduleRevolveShapeUpdate, selectedIds, shapes],
+    [commitShapes, scheduleLatchBoxUpdate, scheduleRevolveShapeUpdate, scheduleSlidingLidBoxUpdate, selectedIds, shapes],
   );
 
   const deleteSelected = useCallback(() => {
@@ -7362,6 +7671,67 @@ export function SketchForgeEditor({
     const duplicates = selectedShapes.map((shape) => cloneWorkplaneShapeTreeWithFreshIds(shape, "copy"));
     commitShapes([...shapes, ...duplicates], duplicates.map((shape) => shape.id), `Duplicated ${duplicates.length} shape${duplicates.length === 1 ? "" : "s"}`);
   }, [commitShapes, hasSelection, selectedShapes, shapes]);
+
+  // Fork feature (see FORK.md): grow or shrink the selected shapes' surfaces by a distance,
+  // e.g. a shaft into the hole it fits in plus a tolerance. Each shape becomes a mesh in place.
+  const offsetSelected = useCallback((distance: number) => {
+    const targets = selectedShapes.filter((shape) => !shape.locked && !isReferenceImage(shape) && !shape.hidden);
+    if (!targets.length) {
+      setNotice("Select an unlocked shape to grow or shrink");
+      return;
+    }
+    if (!Number.isFinite(distance) || distance === 0) {
+      setNotice("Enter a distance other than 0 mm");
+      return;
+    }
+    const replaced = new Map<string, WorkplaneShape>();
+    for (const shape of targets) {
+      const mesh = meshForShape(shape);
+      const positions = mesh.faces.flatMap(([a, b, c]) => [...mesh.vertices[a], ...mesh.vertices[b], ...mesh.vertices[c]]);
+      const before = triangleSoupVolume(positions);
+      const offset = offsetTriangleSoup(positions, distance);
+      const after = triangleSoupVolume(offset);
+      // A shrink that turns the shape inside out (or a grow that loses volume) went past a feature.
+      if (!(after > 0) || (distance > 0 ? after <= before : after >= before)) {
+        setNotice(`${shape.name}: ${Math.abs(distance)} mm is too large for this shape`);
+        return;
+      }
+      replaced.set(shape.id, canonicalizeShape(meshShapeFromWorldPositions(shape, offset)));
+    }
+    const label = `${distance > 0 ? "Grew" : "Shrank"} ${replaced.size} shape${replaced.size === 1 ? "" : "s"} by ${Math.abs(distance)} mm`;
+    commitShapes(shapesRef.current.map((shape) => replaced.get(shape.id) ?? shape), selectedIdsRef.current, label);
+  }, [commitShapes, selectedShapes]);
+
+  // Fork feature (see FORK.md): a new solid filling the selected shape's hollow part (a lid or
+  // plug that fits into it), shrunk by `clearance`. The source shape is left as it is.
+  const fillSelectedHollow = useCallback(async (clearance: number) => {
+    const source = selectedShapes.length === 1 ? selectedShapes[0] : null;
+    if (!source || isReferenceImage(source)) {
+      setNotice("Select one shape to fill its hollow part");
+      return;
+    }
+    const sourceProjectId = projectInfoRef.current.projectId;
+    setNotice("Finding the hollow part…");
+    try {
+      const runtime = await getManifoldRuntime();
+      if (projectInfoRef.current.projectId !== sourceProjectId) return;
+      const mesh = meshForShape(source);
+      const positions = mesh.faces.flatMap(([a, b, c]) => [...mesh.vertices[a], ...mesh.vertices[b], ...mesh.vertices[c]]);
+      const result = cavityFillPositions(runtime, positions, Math.max(0, clearance));
+      if (!result.ok) {
+        setNotice(result.reason);
+        return;
+      }
+      const fill = canonicalizeShape(meshShapeFromWorldPositions(
+        { ...source, id: createLocalId("hollow-fill"), name: `${source.name} fill`, color: "#f2b134", hole: false, locked: false, hidden: false },
+        result.positions,
+      ));
+      const extra = result.regions > 1 ? ` (largest of ${result.regions} empty regions)` : "";
+      commitShapes([...shapesRef.current, fill], fill.id, `Created ${fill.name}${extra}`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not fill the hollow part");
+    }
+  }, [commitShapes, selectedShapes]);
 
   const copySelected = useCallback(() => {
     if (!hasSelection) {
@@ -7389,12 +7759,25 @@ export function SketchForgeEditor({
     if (serializeShapesForSync(sourceClipboard) !== serializeShapesForSync(clipboard)) {
       setClipboard(sourceClipboard);
     }
+    // Fork change (see FORK.md): paste beside the copied shapes, to their right on screen,
+    // on the same row (no move along screen-up or in elevation). The step is the clipboard's
+    // own size along that axis plus a gap, so copies never overlap the original.
+    const sourceKey = serializeShapesForSync(sourceClipboard);
+    const run = pasteRunRef.current?.key === sourceKey ? pasteRunRef.current.count + 1 : 1;
+    pasteRunRef.current = { key: sourceKey, count: run };
+    const right = keyboardMovementAxes(placementWorkplaneRef.current, keyboardMovementView(viewportCameraRef.current?.())).right;
+    const bounds = boundsForShapes(sourceClipboard);
+    const extent = Math.abs(right.x) * (bounds.maxX - bounds.minX)
+      + Math.abs(right.y) * (bounds.maxY - bounds.minY)
+      + Math.abs(right.z) * (bounds.maxZ - bounds.minZ);
+    const step = Math.ceil(extent + PASTE_GAP) * run;
     const pasted = sourceClipboard.map((shape) => {
       const pastedShape = cloneWorkplaneShapeTreeWithFreshIds(shape, "paste");
       return {
         ...pastedShape,
-        x: Math.min(110, shape.x + 12),
-        z: Math.min(110, shape.z + 12),
+        x: cleanNearZero(shape.x + right.x * step),
+        z: cleanNearZero(shape.z + right.z * step),
+        elevation: cleanNearZero((shape.elevation ?? 0) + right.y * step),
       };
     });
     commitShapes([...shapesRef.current, ...pasted], pasted.map((shape) => shape.id), `Pasted ${pasted.length} shape${pasted.length === 1 ? "" : "s"}`);
@@ -8090,6 +8473,11 @@ export function SketchForgeEditor({
       return;
     }
 
+    if (selectedShapes.some(isReferenceImage)) {
+      setNotice("Reference images can't be grouped; deselect them first");
+      return;
+    }
+
     const sourceFingerprint = projectShapesFingerprint(shapesRef.current);
     const sourceProjectId = projectInfoRef.current.projectId;
     const result = await buildGroupedShapeFromSelection(selectedShapes);
@@ -8113,6 +8501,10 @@ export function SketchForgeEditor({
   }, [commitShapes, selectedIds, selectedShapes]);
 
   const intersectSelected = useCallback(async () => {
+    if (selectedShapes.some(isReferenceImage)) {
+      setNotice("Reference images can't be combined; deselect them first");
+      return;
+    }
     const groupable = selectedShapes.filter((shape) => !shape.locked);
     const hasSolid = groupable.some((shape) => !shape.hole);
     const hasHole = groupable.some((shape) => shape.hole);
@@ -8797,7 +9189,8 @@ export function SketchForgeEditor({
 
   const exportDesign = useCallback((format: DirectExportFormat, exportName: string) => {
     const sourceShapes = hasSelection ? selectedShapes : shapes;
-    const exportable = sourceShapes.filter((shape) => !shape.hole);
+    // Reference images (fork) are an overlay only and never exported.
+    const exportable = withoutReferenceImages(sourceShapes).filter((shape) => !shape.hole);
     if (exportable.length === 0) {
       setNotice(hasSelection ? "Select at least one solid shape before exporting" : "Add a solid shape before exporting");
       return;
@@ -8843,7 +9236,7 @@ export function SketchForgeEditor({
     if (stepExporting) {
       return;
     }
-    const sourceShapes = hasSelection ? selectedShapes : shapes;
+    const sourceShapes = withoutReferenceImages(hasSelection ? selectedShapes : shapes);
     if (sourceShapes.some((shape) => shape.hole) && !sourceShapes.some((shape) => !shape.hole)) {
       setNotice("Select at least one solid shape before exporting STEP");
       return;
@@ -8973,7 +9366,7 @@ export function SketchForgeEditor({
     const projectFiles = files.filter((file) => /\.skf$/i.test(file.name));
     if (projectFiles.length) {
       if (files.length !== 1) {
-        setNotice("Open one .skf project at a time; import STL, OBJ, STEP, and SVG geometry separately");
+        setNotice("Open one .skf project at a time; import STL, OBJ, 3MF, STEP, and SVG geometry separately");
         return;
       }
       if (!onOpenSkfProjectFile) {
@@ -8998,6 +9391,17 @@ export function SketchForgeEditor({
         return;
       }
 
+      // Fork (see FORK.md): PNG/JPG/WebP photos become reference images at the view centre.
+      if (isReferenceImageFile(file)) {
+        try {
+          const image = await referenceImageShapeFromFile(file);
+          importedShapes.push({ ...image, ...placementPatchForNewShape(image, placementWorkplaneRef.current, newShapeBasePoint()) });
+        } catch (error) {
+          failures.push({ fileName: file.name, reason: error instanceof Error ? error.message : "Could not read image" });
+        }
+        continue;
+      }
+
       const sourceFormat = sourceFormatForFileName(file.name) ?? (file.type === "image/svg+xml" ? "svg" : null);
       const isStep = sourceFormat === "step";
       const isObj = sourceFormat === "obj";
@@ -9017,6 +9421,8 @@ export function SketchForgeEditor({
           nextShape = await importedShapeFromStep(file.name, buffer);
         } else if (isObj) {
           nextShape = importedShapeFromObj(file.name, new TextDecoder().decode(bytes));
+        } else if (sourceFormat === "3mf") {
+          nextShape = importedShapeFrom3mf(file.name, bytes);
         } else if (isSvg) {
           nextShape = importedShapeFromSvg(file.name, new TextDecoder().decode(bytes));
         } else {
@@ -9064,7 +9470,7 @@ export function SketchForgeEditor({
       `${successSummary}.${failureSummary}`.trim(),
     );
     setTopPanel(null);
-  }, [commitShapes, onOpenSkfProjectFile]);
+  }, [commitShapes, newShapeBasePoint, onOpenSkfProjectFile]);
 
   const selectFiles = useCallback(
     (files: FileList | File[]) => {
@@ -9073,6 +9479,48 @@ export function SketchForgeEditor({
     },
     [importFiles],
   );
+
+  // Fork change (see FORK.md): files dropped anywhere on the editor are imported, with a
+  // full-window overlay while they are dragged. This is the only file-drop import path; the
+  // import dialog's drop zone lets its drops bubble up here. Shape drags from the Shapes menu
+  // carry no files and are left to the viewport.
+  const [fileDragActive, setFileDragActive] = useState(false);
+  useEffect(() => {
+    let depth = 0;
+    const carriesFiles = (event: DragEvent) => Boolean(event.dataTransfer?.types.includes("Files"));
+    const onDragEnter = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      depth += 1;
+      setFileDragActive(true);
+    };
+    const onDragOver = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    };
+    const onDragLeave = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setFileDragActive(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      event.preventDefault();
+      depth = 0;
+      setFileDragActive(false);
+      if (event.dataTransfer?.files.length) selectFiles(event.dataTransfer.files);
+    };
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, [selectFiles]);
 
   const selectShape = useCallback((id: string | string[] | null, mode: "replace" | "toggle" = "replace") => {
     setSelectedIds((current) => {
@@ -9230,7 +9678,8 @@ export function SketchForgeEditor({
 
       if (shortcut && key === "a") {
         event.preventDefault();
-        setSelectedIds(shapes.filter((shape) => !shape.hidden).map((shape) => shape.id));
+        // Reference images (fork) are left out, like box selection does; click one to select it.
+        setSelectedIds(withoutReferenceImages(shapes).filter((shape) => !shape.hidden).map((shape) => shape.id));
         setNotice("Selected all visible shapes");
         return;
       }
@@ -9322,6 +9771,14 @@ export function SketchForgeEditor({
 
   return (
     <div className="sketchforge-editor">
+      {fileDragActive ? (
+        <div className="file-drop-overlay" aria-hidden="true">
+          <div className="file-drop-overlay-card">
+            <strong>Drop to import</strong>
+            <span>STL, OBJ, 3MF, STEP, SVG, a .skf project, or a PNG/JPG reference photo</span>
+          </div>
+        </div>
+      ) : null}
       <SecondaryToolbar
         toolbarMode={toolbarMode}
         projectName={projectName}
@@ -9463,6 +9920,7 @@ export function SketchForgeEditor({
           />
         ) : (
           <WorkplaneViewport
+          cameraAccessRef={viewportCameraRef}
           shapes={viewportShapes}
           selectedIds={selectedIds}
           alignMode={alignMode}
@@ -9493,6 +9951,8 @@ export function SketchForgeEditor({
           onEditSketch={beginSketchEdit}
           canSeparateParts={canSeparateSelectedParts}
           onSeparateParts={separateSelectedParts}
+          onOffsetSelection={offsetSelected}
+          onFillHollow={fillSelectedHollow}
           onUpdateShape={updateShape}
           onWorkspaceSettingsChange={updateProjectWorkspaceSettings}
           onWorkplaneModeChange={closeViewportWorkplaneMode}
@@ -9571,7 +10031,6 @@ export function SketchForgeEditor({
           sharedProjectsEnabled={sharedProjectsEnabled}
           skfExporting={skfExporting}
           stepExporting={stepExporting}
-          onImportFiles={selectFiles}
           onPickFile={() => fileInputRef.current?.click()}
           onPickProjectFile={() => projectFileInputRef.current?.click()}
           onNotice={setNotice}
@@ -9604,7 +10063,7 @@ export function SketchForgeEditor({
         className="hidden-file-input"
         type="file"
         multiple
-        accept=".stl,.obj,.step,.stp,.svg,image/svg+xml"
+        accept=".stl,.obj,.3mf,.step,.stp,.svg,image/svg+xml,.png,.jpg,.jpeg,.webp"
         onChange={(event) => {
           if (event.currentTarget.files) {
             selectFiles(event.currentTarget.files);
@@ -9615,6 +10074,7 @@ export function SketchForgeEditor({
       <div className="editor-toast" role="status">
         {notice}
       </div>
+      {booleanProgress ? <BooleanProgressDialog progress={booleanProgress} /> : null}
       <pre data-codex-state hidden>
         {debugState}
       </pre>
@@ -10410,7 +10870,6 @@ function TopActionPanel({
   sharedProjectsEnabled,
   skfExporting,
   stepExporting,
-  onImportFiles,
   onPickFile,
   onPickProjectFile,
   onNotice,
@@ -10426,7 +10885,6 @@ function TopActionPanel({
   sharedProjectsEnabled: boolean;
   skfExporting: boolean;
   stepExporting: boolean;
-  onImportFiles: (files: FileList | File[]) => void;
   onPickFile: () => void;
   onPickProjectFile: () => void;
   onNotice: (message: string) => void;
@@ -10517,14 +10975,13 @@ function TopActionPanel({
               event.dataTransfer.dropEffect = "copy";
             }}
             onDrop={(event) => {
+              // Keep the browser from opening the file; the editor-wide drop handler imports it.
               event.preventDefault();
-              if (event.dataTransfer.files.length > 0) {
-                onImportFiles(event.dataTransfer.files);
-              }
             }}
           >
             <ToolbarImportIcon />
-            <strong>Drop STL, OBJ, STEP, or SVG files</strong>
+            <strong>Drop STL, OBJ, 3MF, STEP, or SVG files</strong>
+            <span>PNG, JPG and WebP photos become reference images</span>
             <span>or click to choose from your computer</span>
           </button>
         </div>

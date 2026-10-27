@@ -1,4 +1,4 @@
-const SUPPORTED_IMPORT_EXTENSIONS = new Set(["stl", "obj", "svg"]);
+const SUPPORTED_IMPORT_EXTENSIONS = new Set(["stl", "obj", "svg", "3mf"]);
 
 function fileExtension(fileName: string) {
   return fileName.split(".").pop()?.toLowerCase() ?? "";

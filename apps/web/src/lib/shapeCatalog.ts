@@ -1,4 +1,6 @@
 import { canonicalizeShape } from "@/lib/workplaneShapes";
+import { asteriskShapePatch, DEFAULT_ASTERISK_PARAMS } from "@/lib/asterisk";
+import { DEFAULT_DOVETAIL_PARAMS, dovetailShapePatch } from "@/lib/dovetail";
 import { createLocalId } from "@/lib/localIds";
 import {
   DEFAULT_GEAR_CENTER_HOLE_SIZE,
@@ -20,22 +22,38 @@ import type { ShapeAsset, ShapeCustomization, ShapeKind, WorkplaneShape } from "
 export type ToolbarShapeAsset = ShapeAsset & { menuIcon: string };
 
 export const LATCH_BOX_ASSET_ID = "latch-box";
+export const TETRAHEDRON_ASSET_ID = "tetrahedron";
+export const DOVETAIL_ASSET_ID = "dovetail";
+export const ASTERISK_ASSET_ID = "asterisk";
+export const HOLLOW_CYLINDER_ASSET_ID = "hollow-cylinder";
+export const SLIDING_LID_BOX_ASSET_ID = "sliding-lid-box";
 
 export const toolbarShapeAssets: ToolbarShapeAsset[] = [
   { id: "box", name: "Box", src: "assets/sketchforge/shape-icons-gray/box.png", menuIcon: "assets/sketchforge/shape-icons-gray/box.png", kind: "box", color: "#d41721" },
   { id: "cylinder", name: "Cylinder", src: "assets/sketchforge/shape-icons-gray/cylinder.png", menuIcon: "assets/sketchforge/shape-icons-gray/cylinder.png", kind: "cylinder", color: "#d97813" },
+  // Fork feature (see FORK.md): a cylinder preset with a 2 mm wall and floor.
+  { id: HOLLOW_CYLINDER_ASSET_ID, name: "Hollow Cylinder", src: "assets/sketchforge/shape-icons-gray/hollow-cylinder.png", menuIcon: "assets/sketchforge/shape-icons-gray/hollow-cylinder.png", kind: "cylinder", color: "#c9671a" },
   { id: "sphere", name: "Sphere", src: "assets/sketchforge/shape-icons-gray/sphere.png", menuIcon: "assets/sketchforge/shape-icons-gray/sphere.png", kind: "sphere", color: "#0098c7" },
   { id: "cone", name: "Cone", src: "assets/sketchforge/shape-icons-gray/cone.png", menuIcon: "assets/sketchforge/shape-icons-gray/cone.png", kind: "cone", color: "#6e2786" },
   { id: "pyramid", name: "Pyramid", src: "assets/sketchforge/shape-icons-gray/pyramid.png", menuIcon: "assets/sketchforge/shape-icons-gray/pyramid.png", kind: "pyramid", color: "#f2cf10" },
   { id: "wedge", name: "Wedge", src: "assets/sketchforge/shape-icons-gray/wedge.png", menuIcon: "assets/sketchforge/shape-icons-gray/wedge.png", kind: "wedge", color: "#33983d" },
+  // Fork feature (see FORK.md): tetrahedron cut from a cube, tip at the bottom.
+  { id: TETRAHEDRON_ASSET_ID, name: "Tetrahedron", src: "assets/sketchforge/shape-icons-gray/tetrahedron.png", menuIcon: "assets/sketchforge/shape-icons-gray/tetrahedron.png", kind: "mesh", color: "#e0a10b" },
   { id: "text", name: "Text", src: "assets/sketchforge/shape-icons-gray/text.png", menuIcon: "assets/sketchforge/shape-icons-gray/text.png", kind: "text", color: "#cf101b" },
   { id: "round-roof", name: "Round Roof", src: "assets/sketchforge/shape-icons-gray/round-roof.png", menuIcon: "assets/sketchforge/shape-icons-gray/round-roof.png", kind: "roundRoof", color: "#67c4ce" },
   { id: "half-sphere", name: "Half Sphere", src: "assets/sketchforge/shape-icons-gray/half-sphere.png", menuIcon: "assets/sketchforge/shape-icons-gray/half-sphere.png", kind: "halfSphere", color: "#c9009a" },
   { id: "torus", name: "Torus", src: "assets/sketchforge/shape-icons-gray/torus.png", menuIcon: "assets/sketchforge/shape-icons-gray/torus.png", kind: "torus", color: "#0098c7" },
   { id: "tube", name: "Tube", src: "assets/sketchforge/shape-icons-gray/tube.png", menuIcon: "assets/sketchforge/shape-icons-gray/tube.png", kind: "tube", color: "#ce7013" },
   { id: "gear", name: "Gear", src: "assets/sketchforge/gear-types/spur.png", menuIcon: "assets/sketchforge/gear-types/spur.png", kind: "gear", color: "#6f7f8d" },
+  // Fork feature (see FORK.md): parametric asterisk (diameter, arm count, arm thickness).
+  { id: ASTERISK_ASSET_ID, name: "Asterisk", src: "assets/sketchforge/shape-icons-gray/asterisk.png", menuIcon: "assets/sketchforge/shape-icons-gray/asterisk.png", kind: "mesh", color: "#7a4fc4" },
+  // Fork feature (see FORK.md): parametric dovetail joint, male or female.
+  { id: DOVETAIL_ASSET_ID, name: "Dovetail", src: "assets/sketchforge/shape-icons-gray/dovetail.png", menuIcon: "assets/sketchforge/shape-icons-gray/dovetail.png", kind: "mesh", color: "#8a6a4a" },
   // Fork feature (see FORK.md): generated parametric enclosure. The editor's addShape
   // intercepts this id and builds the body + cover asynchronously.
+  // Fork feature (see FORK.md): parametric box with a dovetailed sliding lid. The editor's addShape
+  // intercepts this id and builds the body + lid with Manifold.
+  { id: SLIDING_LID_BOX_ASSET_ID, name: "Sliding Lid Box", src: "assets/sketchforge/shape-icons-gray/sliding-lid-box.png", menuIcon: "assets/sketchforge/shape-icons-gray/sliding-lid-box.png", kind: "mesh", color: "#5d8fbf" },
   { id: LATCH_BOX_ASSET_ID, name: "Latch Box", src: "assets/sketchforge/shape-icons-gray/box.png", menuIcon: "assets/sketchforge/shape-icons-gray/box.png", kind: "mesh", color: "#7d93b8" },
 ];
 
@@ -99,7 +117,12 @@ export function sceneShape(shape: Partial<WorkplaneShape> & Pick<WorkplaneShape,
     boxCorners: shape.boxCorners,
     boxWall: shape.boxWall,
     boxFloor: shape.boxFloor,
+    cylinderWall: shape.cylinderWall,
+    cylinderFloor: shape.cylinderFloor,
     latchBox: shape.latchBox,
+    dovetail: shape.dovetail,
+    asterisk: shape.asterisk,
+    slidingLidBox: shape.slidingLidBox,
     openscadSource: shape.openscadSource,
     steps: shape.steps,
     sides: shape.sides,
@@ -137,6 +160,22 @@ export function sceneShape(shape: Partial<WorkplaneShape> & Pick<WorkplaneShape,
   });
 }
 
+/**
+ * Tetrahedron mesh (4 triangles): the top is half of a cube's top face, cut along its
+ * diagonal, and the tip sits at the bottom straight under the top's right-angle corner, so two
+ * sides are vertical and one slopes. Mesh coordinates: X/Z centred, base at y = 0.
+ */
+export function tetrahedronPositions(width: number, depth: number, height: number) {
+  const w = width / 2;
+  const d = depth / 2;
+  const a = [-w, height, -d]; // right-angle corner of the top
+  const b = [w, height, -d];
+  const c = [-w, height, d];
+  const tip = [-w, 0, -d];
+  // Counter-clockwise from outside: top, back (-Z), left (-X), sloped face.
+  return [a, c, b, a, b, tip, a, tip, c, b, c, tip].flat();
+}
+
 export function makeShapeFromAsset(
   asset: ShapeAsset,
   point?: { x: number; z: number; elevation?: number },
@@ -150,7 +189,7 @@ export function makeShapeFromAsset(
   const gearTeeth = asset.kind === "gear" ? normalizeGearTeeth(customization.teeth ?? DEFAULT_GEAR_TEETH) : undefined;
   const gearToothSize = asset.kind === "gear" ? normalizeGearToothSize(customization.toothSize ?? DEFAULT_GEAR_TOOTH_SIZE, width, depth) : undefined;
 
-  return {
+  const shape: WorkplaneShape = {
     id: createLocalId(asset.id),
     name: asset.name,
     kind: asset.kind,
@@ -184,7 +223,20 @@ export function makeShapeFromAsset(
     gearType: asset.kind === "gear" ? normalizeGearType(customization.gearType ?? DEFAULT_GEAR_TYPE) : undefined,
     helixAngle: asset.kind === "gear" ? normalizeGearHelixAngle(customization.helixAngle ?? DEFAULT_GEAR_HELIX_ANGLE) : undefined,
     helixQuality: asset.kind === "gear" ? normalizeGearHelixQuality(customization.helixQuality ?? DEFAULT_GEAR_HELIX_QUALITY) : undefined,
+    importedMesh: asset.id === TETRAHEDRON_ASSET_ID
+      ? {
+          positions: tetrahedronPositions(width, depth, height),
+          baseWidth: width,
+          baseDepth: depth,
+          baseHeight: height,
+          triangleCount: 4,
+          sourceFormat: "json",
+        }
+      : undefined,
     locked: false,
     hidden: false,
   };
+  if (asset.id === HOLLOW_CYLINDER_ASSET_ID) return { ...shape, cylinderWall: 2, cylinderFloor: 2 };
+  if (asset.id === ASTERISK_ASSET_ID) return { ...shape, ...asteriskShapePatch(DEFAULT_ASTERISK_PARAMS) };
+  return asset.id === DOVETAIL_ASSET_ID ? { ...shape, ...dovetailShapePatch(DEFAULT_DOVETAIL_PARAMS) } : shape;
 }

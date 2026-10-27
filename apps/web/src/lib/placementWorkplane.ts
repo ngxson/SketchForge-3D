@@ -195,3 +195,40 @@ export function placementWorkplaneIsBase(workplane: PlacementWorkplane) {
     && Math.abs(workplane.normal.z) < 1e-6
   );
 }
+
+/**
+ * Shift-drag axis lock: keeps only the larger of the delta's components along the workplane
+ * X and Z axes, so the shape moves along one grid line through where the drag started.
+ */
+export function axisLockedDragDelta(delta: PlacementPoint, workplane: PlacementWorkplane, locked: boolean): PlacementPoint {
+  if (!locked) return delta;
+  const along = (axis: PlacementPoint) => delta.x * axis.x + delta.y * axis.y + delta.z * axis.z;
+  const u = along(workplane.xAxis);
+  const v = along(workplane.zAxis);
+  const [axis, amount] = Math.abs(u) >= Math.abs(v) ? [workplane.xAxis, u] : [workplane.zAxis, v];
+  return { x: axis.x * amount, y: axis.y * amount, z: axis.z * amount };
+}
+
+/**
+ * Where the centre of the view meets the workplane, snapped to the grid in workplane
+ * coordinates (fork change, see FORK.md: new shapes spawn at the view centre). The view is the
+ * camera position and the direction it looks in. An orthographic camera sees along a line
+ * through its position in both directions; a perspective camera only in front of it.
+ * Returns null when the view runs along the plane or (perspective) the plane is behind it.
+ */
+export function viewCenterOnWorkplane(
+  workplane: PlacementWorkplane,
+  view: { position: PlacementPoint; forward: PlacementPoint; orthographic: boolean },
+  step = 0,
+): PlacementPoint | null {
+  const normal = vector(workplane.normal);
+  const forward = vector(view.forward);
+  const facing = normal.dot(forward);
+  if (Math.abs(facing) < 0.05) return null;
+  const distance = normal.dot(vector(workplane.origin).sub(vector(view.position))) / facing;
+  if (!view.orthographic && distance <= 0) return null;
+  const hit = vector(view.position).addScaledVector(forward, distance);
+  const local = placementWorkplaneCoordinates(workplane, point(hit));
+  const snap = (value: number) => clean(step > 0 ? Math.round(value / step) * step : value);
+  return placementWorkplanePoint(workplane, snap(local.x), snap(local.z));
+}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ShapeAsset } from "@/types/sketchforge";
-import { makeShapeFromAsset, sceneShape, toolbarShapeAssets } from "@/lib/shapeCatalog";
+import { TETRAHEDRON_ASSET_ID, makeShapeFromAsset, sceneShape, toolbarShapeAssets } from "@/lib/shapeCatalog";
 
 describe("shape catalog", () => {
   it("does not expose removed decorative shapes in the toolbar catalog", () => {
@@ -113,5 +113,25 @@ describe("shape catalog", () => {
       hidden: false,
     });
     expect(created.mirrorX).toBeUndefined();
+  });
+
+  it("creates the tetrahedron as a closed 4-face mesh with the tip at the bottom", () => {
+    const asset = toolbarShapeAssets.find((entry) => entry.id === TETRAHEDRON_ASSET_ID)!;
+    const shape = makeShapeFromAsset(asset);
+    expect(shape).toMatchObject({ name: "Tetrahedron", kind: "mesh", width: 20, depth: 20, height: 20 });
+    const positions = shape.importedMesh!.positions;
+    expect(positions).toHaveLength(4 * 9);
+    const points = Array.from({ length: 12 }, (_, i) => positions.slice(i * 3, i * 3 + 3));
+    // One vertex at the bottom (the tip), three on the top.
+    const distinct = new Set(points.map((p) => p.join(",")));
+    expect(distinct.size).toBe(4);
+    expect([...distinct].filter((key) => key.split(",")[1] === "0")).toEqual(["-10,0,-10"]);
+    // Every face winds outward: positive signed volume equals the tetrahedron volume (cube / 6).
+    let volume = 0;
+    for (let i = 0; i < 12; i += 3) {
+      const [a, b, c] = [points[i], points[i + 1], points[i + 2]];
+      volume += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6;
+    }
+    expect(volume).toBeCloseTo(8000 / 6, 6);
   });
 });

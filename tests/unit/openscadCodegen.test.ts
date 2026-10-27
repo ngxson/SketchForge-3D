@@ -156,6 +156,16 @@ describe("generateOpenScadFromShapes", () => {
     expect(hollow.source).toContain("translate([0, 0, 1]) cube([16, 6, 6], center = true);");
   });
 
+  it("emits hollow cylinders with a floor or open bottom", () => {
+    const cup = generateOpenScadFromShapes([shape({ kind: "cylinder", width: 20, depth: 20, height: 10, sides: 32, cylinderWall: 2, cylinderFloor: 3 })]);
+    expect(cup.source).toContain("difference() {");
+    expect(cup.source).toContain("cylinder(h = 10, d = 20, center = true, $fn = 32);");
+    // Hole from z = -5 + 3 up to 1 mm above the top (z = 6): 8 mm tall, centred at z = 2.
+    expect(cup.source).toContain("translate([0, 0, 2]) cylinder(h = 8, d = 16, center = true, $fn = 32);");
+    const tube = generateOpenScadFromShapes([shape({ kind: "cylinder", width: 20, depth: 20, height: 10, sides: 32, cylinderWall: 2, cylinderFloor: 0 })]);
+    expect(tube.source).toContain("translate([0, 0, 0]) cylinder(h = 12, d = 16, center = true, $fn = 32);");
+  });
+
   it("describes an empty scene", () => {
     const result = generateOpenScadFromShapes([]);
     expect(result.source).toContain("// The scene is empty.");

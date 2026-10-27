@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WorkplaneWorkspaceSettings } from "@/types/sketchforge";
 import { formatMeasurementNumber, lengthDisplayUnit, millimetersToDisplay, normalizeScaleForUnits, parseMeasurementInput, scaleOptionsForUnits } from "@/lib/measurementUnits";
-import { canBeginShapeDrag, DEFAULT_SNAP_GRID, DEFAULT_WORKPLANE_WORKSPACE, normalizeSnapGrid, normalizeWorkspaceSettings, shapeDimensionLimit, workplaneSettingsFingerprint, workspaceHydrationSyncDecision } from "@/lib/workplaneSettings";
+import { canBeginShapeDrag, DEFAULT_SNAP_GRID, DEFAULT_WORKPLANE_WORKSPACE, normalizeSnapGrid, normalizeWorkspaceSettings, shapeDimensionLimit, workplaneSettingsFingerprint, workspaceHydrationPendingFingerprint, workspaceHydrationSyncDecision } from "@/lib/workplaneSettings";
 
 describe("workplane settings helpers", () => {
   it("accepts known snap grid values and falls back for unknown values", () => {
@@ -160,4 +160,21 @@ describe("workplane settings helpers", () => {
 
     expect(workspaceHydrationSyncDecision(hydratedCommit.pendingFingerprint, projectTwo).shouldSync).toBe(true);
   });
+
+  it("keeps syncing snap changes after the parent echoes one back (fork fix)", () => {
+    const snap1 = workplaneSettingsFingerprint(DEFAULT_WORKPLANE_WORKSPACE, "1.0 mm");
+    const snap5 = workplaneSettingsFingerprint(DEFAULT_WORKPLANE_WORKSPACE, "5.0 mm");
+    const snapHalf = workplaneSettingsFingerprint(DEFAULT_WORKPLANE_WORKSPACE, "0.5 mm");
+
+    // The user picks 5 mm here; the parent saves it and passes it back as the initial snap. The
+    // viewport already shows 5 mm, so no state change follows and nothing must be awaited.
+    const pending = workspaceHydrationPendingFingerprint(snap5, snap5);
+    expect(pending).toBeNull();
+    // The next change (0.5 mm) is synced to the parent.
+    expect(workspaceHydrationSyncDecision(pending, snapHalf).shouldSync).toBe(true);
+
+    // A real hydration (another project's settings) still blocks the stale commit.
+    expect(workspaceHydrationPendingFingerprint(snap5, snap1)).toBe(snap1);
+  });
 });
+
